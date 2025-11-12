@@ -10,9 +10,12 @@ class AnnotationManager:
     
     def __init__(self):
         self.actions: List[Dict] = []  # List of action records
-        self.current_action_start: Optional[Dict] = None  # Pending action
+        self.current_action_start: Optional[Dict] = None  # Pending action (legacy)
         self.yolo_boxes: Dict[int, List[Tuple]] = {}  # {frame_idx: [(cls, x, y, w, h), ...]}
         self.next_action_id = 1  # Auto-incrementing action ID
+        
+        # Auto-tracking: active actions by type
+        self.active_actions: Dict[str, Dict] = {}  # {action_type: {start_frame, start_time, fps}}
 
     def start_action(self, frame_idx: int, action_type: str, fps: float = 30.0) -> bool:
         """
@@ -264,5 +267,76 @@ class AnnotationManager:
             "action_counts": action_counts,
             "total_frames_with_boxes": total_frames_with_boxes,
             "total_boxes": total_boxes,
-            "pending_action": self.current_action_start is not None
+            "pending_action": self.current_action_start is not None,
+            "active_actions": len(self.active_actions)
         }
+    
+    def auto_start_action(self, frame_idx: int, action_type: str, fps: float = 30.0):
+        """Auto-start an action when a box appears (supports multiple simultaneous actions)."""
+        if action_type not in self.active_actions:
+            self.active_actions[action_type] = {
+                "start_frame": frame_idx,
+                "start_time": frame_idx / fps,
+                "fps": fps,
+                "last_frame": frame_idx
+            }
+            logger.info(f"Auto-started action: {action_type} at frame {frame_idx}")
+    
+    def auto_update_action(self, frame_idx: int, action_type: str):
+        """Update last frame of an active action."""
+        if action_type in self.active_actions:
+            self.active_actions[action_type]["last_frame"] = frame_idx
+    
+    def auto_end_action(self, action_type: str) -> Optional[Dict]:
+        """Auto-end an action when box disappears."""
+        if action_type not in self.active_actions:
+            return None
+        
+        active = self.active_actions.pop(action_type)
+        start_frame = active["start_frame"]
+        end_frame = active["last_frame"]
+        fps = active.get("fps", 30.0)
+        
+        action = {
+            "id": self.next_action_id,
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "type": action_type,
+            "start_time": start_frame / fps,
+            "end_time": end_frame / fps,
+            "created_at": datetime.now().isoformat(),
+            "auto_tracked": True
+        }
+        self.actions.append(action)
+        self.next_action_id += 1
+        
+        logger.info(
+            f"Auto-completed action: {action_type} | "
+            f"Frames {start_frame}-{end_frame} | "
+            f"Duration: {action['end_time'] - action['start_time']:.2f}s"
+        )
+        return action
+    
+    def check_box_tracking(self, current_frame: int, fps: float = 30.0):
+        """Check if boxes exist and manage auto-tracking."""
+        # Get frames with boxes in a window around current frame
+        window_start = max(0, current_frame - 1)
+        window_end = current_frame + 1
+        
+        # Detect which action types have boxes in current frame
+        current_box_types = set()
+        if current_frame in self.yolo_boxes:
+            # Map box class to action type (simplified: assume class 0 = ball detection)
+            # For volleyball, we might detect ball presence
+            current_box_types.add("Ball")  # Example: ball tracking
+        
+        # Check active actions
+        for action_type in list(self.active_actions.keys()):
+            if action_type in current_box_types:
+                # Action still has boxes, update last frame
+                self.auto_update_action(current_frame, action_type)
+            else:
+                # No boxes for this action type in current frame
+                # Check if it's really disappeared (grace period)
+                # For now, end it immediately
+                pass  # Can add grace period logic here

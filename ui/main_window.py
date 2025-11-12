@@ -1,5 +1,6 @@
 """Main window for VAA application."""
 from typing import Optional
+import cv2
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QFileDialog, QMessageBox, QLabel, QPushButton,
@@ -72,8 +73,10 @@ class VideoAnnotationApp(QMainWindow):
         # Canvas
         self.canvas = ImageCanvas(self)
         self.canvas.set_box_colors(self.ui_config.box_colors)
+        self.canvas.set_box_classes(self.annot_config.box_classes)
         self.canvas.box_added.connect(self.on_box_added)
         self.canvas.box_removed.connect(self.on_box_removed)
+        self.canvas.box_class_changed.connect(self.on_box_class_changed)
         left_panel.addWidget(self.canvas, stretch=1)
         
         # Control bar
@@ -107,6 +110,15 @@ class VideoAnnotationApp(QMainWindow):
         self.boxes_cb.setChecked(self.show_boxes)
         self.boxes_cb.stateChanged.connect(self.toggle_boxes)
         control_bar.addWidget(self.boxes_cb)
+        
+        # Add class selector for drawing
+        control_bar.addWidget(QLabel("Draw Class:"))
+        from PyQt6.QtWidgets import QComboBox
+        self.class_combo = QComboBox()
+        for class_id, class_name in sorted(self.annot_config.box_classes.items()):
+            self.class_combo.addItem(class_name, class_id)
+        self.class_combo.currentIndexChanged.connect(self.on_class_selection_changed)
+        control_bar.addWidget(self.class_combo)
         
         self.time_label = QLabel("00:00.0 / 00:00.0")
         self.time_label.setStyleSheet("font-family: monospace; font-size: 14px;")
@@ -334,6 +346,14 @@ class VideoAnnotationApp(QMainWindow):
         self.show_boxes = (state == Qt.CheckState.Checked.value)
         self.canvas.toggle_boxes_visibility(self.show_boxes)
     
+    def on_class_selection_changed(self, index):
+        """Handle class selection change for drawing new boxes."""
+        class_id = self.class_combo.itemData(index)
+        if class_id is not None:
+            self.canvas.set_current_class(class_id)
+            class_name = self.annot_config.box_classes.get(class_id, f"Class {class_id}")
+            self.status_bar.showMessage(f"Drawing class set to: {class_name}")
+    
     def update_display(self):
         """Update the canvas with current frame."""
         if not self.processor:
@@ -349,10 +369,13 @@ class VideoAnnotationApp(QMainWindow):
             logger.warning(f"Failed to get frame {self.current_frame_idx}")
             return
         
+        # Convert BGR to RGB (OpenCV uses BGR, Qt uses RGB)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
         # Convert to QPixmap
-        h, w, ch = frame.shape
+        h, w, ch = frame_rgb.shape
         bytes_per_line = ch * w
-        qimg = QImage(frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        qimg = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(qimg)
         
         # Get boxes for current frame
@@ -451,6 +474,21 @@ class VideoAnnotationApp(QMainWindow):
         """Handle box removed event from canvas."""
         self.annotations.remove_yolo_box(self.current_frame_idx, box_index)
         self.status_bar.showMessage(f"Box removed from frame {self.current_frame_idx}")
+    
+    def on_box_class_changed(self, box_index: int, new_class_id: int):
+        """Handle box class change event from canvas."""
+        # Update the box in annotations
+        if self.current_frame_idx in self.annotations.yolo_boxes:
+            boxes = self.annotations.yolo_boxes[self.current_frame_idx]
+            if 0 <= box_index < len(boxes):
+                old_box = boxes[box_index]
+                # Update class while keeping coordinates
+                new_box = (new_class_id, old_box[1], old_box[2], old_box[3], old_box[4])
+                boxes[box_index] = new_box
+                
+                class_name = self.annot_config.box_classes.get(new_class_id, f"Class {new_class_id}")
+                self.status_bar.showMessage(f"Box class changed to {class_name}")
+                logger.info(f"Frame {self.current_frame_idx}, Box {box_index} class changed to {class_name}")
     
     # Export methods
     
