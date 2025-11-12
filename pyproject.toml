@@ -1,0 +1,16 @@
+[project]
+name = "VAA"
+version = "0.1.0"
+description = "Volleyball Action Annotator (VAA) e"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "inference-sdk>=0.46.1",
+    "lap>=0.5.12",
+    "loguru>=0.7.3",
+    "numpy>=2.1.1",
+    "opencv-python>=4.8.0",
+    "pyqt6==6.9.0",
+    "roboflow>=1.1.63",
+    "ultralytics>=8.3.103",
+]

@@ -1,0 +1,23 @@
+[
+  {
+    "start_time": 5.572233333333333,
+    "end_time": 5.772433333333334,
+    "type": "Serve",
+    "start_frame": 167,
+    "end_frame": 173
+  },
+  {
+    "start_time": 7.440766666666667,
+    "end_time": 7.6076,
+    "type": "Reception",
+    "start_frame": 223,
+    "end_frame": 228
+  },
+  {
+    "start_time": 17.851166666666668,
+    "end_time": 18.8188,
+    "type": "Serve",
+    "start_frame": 535,
+    "end_frame": 564
+  }
+]
