@@ -11,6 +11,4 @@ dependencies = [
     "numpy>=2.1.1",
     "opencv-python>=4.8.0",
     "pyqt6==6.9.0",
-    "roboflow>=1.1.63",
-    "ultralytics>=8.3.103",
 ]
