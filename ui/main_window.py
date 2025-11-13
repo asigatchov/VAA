@@ -242,6 +242,17 @@ class VideoAnnotationApp(QMainWindow):
         end_shortcut.setShortcut("End")
         end_shortcut.triggered.connect(lambda: self.seek(self.processor.total_frames - 1) if self.processor else None)
         self.addAction(end_shortcut)
+        
+        # Copy/Paste shortcuts
+        copy_shortcut = QAction(self)
+        copy_shortcut.setShortcut("Ctrl+C")
+        copy_shortcut.triggered.connect(self.copy_boxes)
+        self.addAction(copy_shortcut)
+        
+        paste_shortcut = QAction(self)
+        paste_shortcut.setShortcut("Ctrl+V")
+        paste_shortcut.triggered.connect(self.paste_boxes)
+        self.addAction(paste_shortcut)
     
     # Video loading and playback methods
     
@@ -489,6 +500,33 @@ class VideoAnnotationApp(QMainWindow):
                 class_name = self.annot_config.box_classes.get(new_class_id, f"Class {new_class_id}")
                 self.status_bar.showMessage(f"Box class changed to {class_name}")
                 logger.info(f"Frame {self.current_frame_idx}, Box {box_index} class changed to {class_name}")
+    
+    def copy_boxes(self):
+        """Copy all boxes from current frame to clipboard (Ctrl+C)."""
+        if not self.processor:
+            return
+        
+        count = self.canvas.copy_boxes()
+        if count > 0:
+            self.status_bar.showMessage(f"Copied {count} boxes from frame {self.current_frame_idx}")
+        else:
+            self.status_bar.showMessage("No boxes to copy")
+    
+    def paste_boxes(self):
+        """Paste boxes from clipboard to current frame (Ctrl+V)."""
+        if not self.processor:
+            return
+        
+        count = self.canvas.paste_boxes()
+        if count > 0:
+            # Add pasted boxes to annotations
+            for box in self.canvas.boxes[-count:]:  # Get last 'count' boxes
+                self.annotations.add_yolo_box(self.current_frame_idx, box)
+            
+            self.status_bar.showMessage(f"Pasted {count} boxes to frame {self.current_frame_idx}")
+            self.update_display()
+        else:
+            self.status_bar.showMessage("No boxes in clipboard to paste")
     
     # Export methods
     

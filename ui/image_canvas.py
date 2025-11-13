@@ -34,12 +34,18 @@ class ImageCanvas(QLabel):
         self.draw_start: Optional[QPoint] = None
         self.draw_end: Optional[QPoint] = None
         self.current_class_id = 0  # Default to Ball (class 0)
+        self.last_used_class_id = 0  # Remember last used class for continuity
         
         # Editing state
         self.is_dragging = False
         self.drag_start: Optional[QPoint] = None
         self.drag_box_original: Optional[Tuple] = None  # Original box before drag
-        self.resize_mode: Optional[str] = None  # 'tl', 'tr', 'bl', 'br', 'move'
+        self.resize_mode: Optional[str] = None  # 'tl', 'tr', 'bl', 'br', 'move', None
+        self.is_resizing = False
+        self.corner_grab_distance = 5  # Pixels from corner to activate resize
+        
+        # Clipboard for copy/paste
+        self.clipboard_boxes: List[Tuple] = []
         
         # Display settings
         self.show_boxes = True
@@ -73,6 +79,7 @@ class ImageCanvas(QLabel):
     def set_current_class(self, class_id: int):
         """Set the current class for new boxes."""
         self.current_class_id = class_id
+        self.last_used_class_id = class_id  # Remember for next box
     
     def toggle_boxes_visibility(self, visible: bool):
         """Toggle bounding box visibility."""
@@ -144,7 +151,7 @@ class ImageCanvas(QLabel):
             painter.drawText(box_x, box_y - 5, class_name)
     
     def mousePressEvent(self, event: QMouseEvent):
-        """Handle mouse press for box creation/selection."""
+        """Handle mouse press for box creation/selection/resizing."""
         pos = event.pos()
         
         # Check if clicking on existing box
@@ -161,26 +168,45 @@ class ImageCanvas(QLabel):
             return
         
         if clicked_box_idx is not None:
-            # Select box
-            self.selected_box_idx = clicked_box_idx
-            self.box_selected.emit(clicked_box_idx)
-            self.is_dragging = True
-            self.drag_start = pos
+            # Check if clicking near a corner for resizing
+            corner = self._find_box_corner_at_position(pos, clicked_box_idx)
+            if corner:
+                # Start resizing
+                self.selected_box_idx = clicked_box_idx
+                self.is_resizing = True
+                self.resize_mode = corner
+                self.drag_start = pos
+                self.drag_box_original = self.boxes[clicked_box_idx]
+                logger.debug(f"Resizing box {clicked_box_idx}, corner: {corner}")
+            else:
+                # Select and move box
+                self.selected_box_idx = clicked_box_idx
+                self.box_selected.emit(clicked_box_idx)
+                self.is_dragging = True
+                self.drag_start = pos
             self.update()
         else:
-            # Start drawing new box
+            # Start drawing new box with last used class
             self.is_drawing = True
             self.draw_start = pos
             self.draw_end = pos
             self.selected_box_idx = None
+            # Use last used class for continuity
+            self.current_class_id = self.last_used_class_id
     
     def mouseMoveEvent(self, event: QMouseEvent):
-        """Handle mouse move for box drawing/editing."""
+        """Handle mouse move for box drawing/editing/resizing."""
         pos = event.pos()
         
         if self.is_drawing:
             self.draw_end = pos
             self.update()
+        elif self.is_resizing and self.drag_start and self.selected_box_idx is not None:
+            # Resize the selected box
+            if 0 <= self.selected_box_idx < len(self.boxes):
+                delta_pos = pos - self.drag_start
+                self._resize_box(self.selected_box_idx, delta_pos)
+                self.update()
         elif self.is_dragging and self.drag_start and self.selected_box_idx is not None:
             # Move the selected box
             if 0 <= self.selected_box_idx < len(self.boxes):
@@ -202,6 +228,9 @@ class ImageCanvas(QLabel):
             if box:  # Only add if valid
                 self.boxes.append(box)
                 self.box_added.emit(box)
+                # Remember this class for next box
+                self.last_used_class_id = box[0]
+                self.current_class_id = box[0]
             
             self.is_drawing = False
             self.draw_start = None
@@ -209,6 +238,8 @@ class ImageCanvas(QLabel):
             self.update()
         
         self.is_dragging = False
+        self.is_resizing = False
+        self.resize_mode = None
         self.drag_start = None
     
     def keyPressEvent(self, event):
@@ -373,3 +404,140 @@ class ImageCanvas(QLabel):
             
             class_name = self.box_classes.get(removed_box[0], f"Class {removed_box[0]}")
             logger.info(f"Box deleted via context menu: {class_name}")
+    
+    def _find_box_corner_at_position(self, pos: QPoint, box_idx: int) -> Optional[str]:
+        """Find which corner of a box is near the position (for resizing).
+        
+        Returns:
+            'tl' (top-left), 'tr' (top-right), 'bl' (bottom-left), 'br' (bottom-right), or None
+        """
+        if not self.current_pixmap or box_idx >= len(self.boxes):
+            return None
+        
+        cls_id, x_c, y_c, w, h = self.boxes[box_idx]
+        
+        # Get image display dimensions
+        widget_rect = self.rect()
+        scaled_size = self.current_pixmap.scaled(
+            widget_rect.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        ).size()
+        
+        x_offset = (widget_rect.width() - scaled_size.width()) // 2
+        y_offset = (widget_rect.height() - scaled_size.height()) // 2
+        img_width = scaled_size.width()
+        img_height = scaled_size.height()
+        
+        # Calculate box corners in pixel coordinates
+        box_x1 = int((x_c - w/2) * img_width) + x_offset
+        box_y1 = int((y_c - h/2) * img_height) + y_offset
+        box_x2 = int((x_c + w/2) * img_width) + x_offset
+        box_y2 = int((y_c + h/2) * img_height) + y_offset
+        
+        mouse_x = pos.x()
+        mouse_y = pos.y()
+        grab_dist = self.corner_grab_distance
+        
+        # Check each corner
+        if abs(mouse_x - box_x1) <= grab_dist and abs(mouse_y - box_y1) <= grab_dist:
+            return 'tl'  # Top-left
+        elif abs(mouse_x - box_x2) <= grab_dist and abs(mouse_y - box_y1) <= grab_dist:
+            return 'tr'  # Top-right
+        elif abs(mouse_x - box_x1) <= grab_dist and abs(mouse_y - box_y2) <= grab_dist:
+            return 'bl'  # Bottom-left
+        elif abs(mouse_x - box_x2) <= grab_dist and abs(mouse_y - box_y2) <= grab_dist:
+            return 'br'  # Bottom-right
+        
+        return None
+    
+    def _resize_box(self, box_idx: int, delta: QPoint):
+        """Resize a bounding box by dragging a corner."""
+        if not self.current_pixmap or box_idx >= len(self.boxes) or not self.drag_box_original:
+            return
+        
+        if not self.resize_mode:
+            return
+        
+        # Get original box
+        cls_id, orig_x_c, orig_y_c, orig_w, orig_h = self.drag_box_original
+        
+        # Get image display dimensions
+        widget_rect = self.rect()
+        scaled_size = self.current_pixmap.scaled(
+            widget_rect.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        ).size()
+        
+        x_offset = (widget_rect.width() - scaled_size.width()) // 2
+        y_offset = (widget_rect.height() - scaled_size.height()) // 2
+        img_width = scaled_size.width()
+        img_height = scaled_size.height()
+        
+        # Convert delta to normalized coordinates
+        delta_x_norm = delta.x() / img_width
+        delta_y_norm = delta.y() / img_height
+        
+        # Calculate new box dimensions based on which corner is being dragged
+        new_x_c = orig_x_c
+        new_y_c = orig_y_c
+        new_w = orig_w
+        new_h = orig_h
+        
+        if self.resize_mode == 'tl':  # Top-left corner
+            new_w = orig_w - delta_x_norm
+            new_h = orig_h - delta_y_norm
+            new_x_c = orig_x_c + delta_x_norm / 2
+            new_y_c = orig_y_c + delta_y_norm / 2
+        elif self.resize_mode == 'tr':  # Top-right corner
+            new_w = orig_w + delta_x_norm
+            new_h = orig_h - delta_y_norm
+            new_x_c = orig_x_c + delta_x_norm / 2
+            new_y_c = orig_y_c + delta_y_norm / 2
+        elif self.resize_mode == 'bl':  # Bottom-left corner
+            new_w = orig_w - delta_x_norm
+            new_h = orig_h + delta_y_norm
+            new_x_c = orig_x_c + delta_x_norm / 2
+            new_y_c = orig_y_c + delta_y_norm / 2
+        elif self.resize_mode == 'br':  # Bottom-right corner
+            new_w = orig_w + delta_x_norm
+            new_h = orig_h + delta_y_norm
+            new_x_c = orig_x_c + delta_x_norm / 2
+            new_y_c = orig_y_c + delta_y_norm / 2
+        
+        # Ensure minimum size and valid range
+        min_size = 0.02  # Minimum 2% of frame
+        new_w = max(min_size, min(1.0, new_w))
+        new_h = max(min_size, min(1.0, new_h))
+        
+        # Clamp center position
+        new_x_c = max(new_w/2, min(1.0 - new_w/2, new_x_c))
+        new_y_c = max(new_h/2, min(1.0 - new_h/2, new_y_c))
+        
+        # Update box
+        self.boxes[box_idx] = (cls_id, new_x_c, new_y_c, new_w, new_h)
+        logger.debug(f"Box {box_idx} resized to ({new_w:.3f}, {new_h:.3f})")
+    
+    def copy_boxes(self):
+        """Copy all boxes from current frame to clipboard."""
+        self.clipboard_boxes = [box for box in self.boxes]
+        logger.info(f"Copied {len(self.clipboard_boxes)} boxes to clipboard")
+        return len(self.clipboard_boxes)
+    
+    def paste_boxes(self):
+        """Paste boxes from clipboard to current frame."""
+        if not self.clipboard_boxes:
+            logger.warning("No boxes in clipboard to paste")
+            return 0
+        
+        # Add all clipboard boxes to current frame
+        pasted_count = 0
+        for box in self.clipboard_boxes:
+            self.boxes.append(box)
+            self.box_added.emit(box)
+            pasted_count += 1
+        
+        self.update()
+        logger.info(f"Pasted {pasted_count} boxes from clipboard")
+        return pasted_count
