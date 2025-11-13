@@ -23,7 +23,7 @@ class ImageCanvas(QLabel):
         
         # State
         self.current_pixmap: Optional[QPixmap] = None
-        self.boxes: List[Tuple[int, float, float, float, float]] = []  # (cls, x_c, y_c, w, h) normalized
+        self.boxes: List[Tuple] = []  # (cls, x_c, y_c, w, h, box_id) normalized
         self.selected_box_idx: Optional[int] = None
         self.box_colors = {0: QColor("#FF0000"), 1: QColor("#0000FF")}  # Default colors
         self.box_classes = {0: "Class 0", 1: "Class 1"}  # Default class names
@@ -61,7 +61,7 @@ class ImageCanvas(QLabel):
         
         Args:
             pixmap: QPixmap to display
-            boxes: List of bounding boxes (class_id, x_center, y_center, width, height) normalized [0-1]
+            boxes: List of bounding boxes (class_id, x_center, y_center, width, height, box_id) normalized [0-1]
         """
         self.current_pixmap = pixmap
         self.boxes = boxes if boxes is not None else []
@@ -125,7 +125,14 @@ class ImageCanvas(QLabel):
     
     def _draw_boxes(self, painter: QPainter, x_offset: int, y_offset: int, img_width: int, img_height: int):
         """Draw all bounding boxes."""
-        for idx, (cls_id, x_c, y_c, w, h) in enumerate(self.boxes):
+        for idx, box in enumerate(self.boxes):
+            # Unpack box (handle both old 5-element and new 6-element format)
+            if len(box) == 6:
+                cls_id, x_c, y_c, w, h, box_id = box
+            else:
+                cls_id, x_c, y_c, w, h = box
+                box_id = None
+                
             # Convert normalized coordinates to pixel coordinates
             box_x = int((x_c - w/2) * img_width) + x_offset
             box_y = int((y_c - h/2) * img_height) + y_offset
@@ -145,10 +152,14 @@ class ImageCanvas(QLabel):
             painter.setPen(pen)
             painter.drawRect(box_x, box_y, box_w, box_h)
             
-            # Draw class label above box
+            # Draw class label with ID above box
             class_name = self.box_classes.get(cls_id, f"Class {cls_id}")
+            if box_id is not None:
+                label_text = f"{class_name} #{box_id}"
+            else:
+                label_text = class_name
             painter.setFont(painter.font())
-            painter.drawText(box_x, box_y - 5, class_name)
+            painter.drawText(box_x, box_y - 5, label_text)
     
     def mousePressEvent(self, event: QMouseEvent):
         """Handle mouse press for box creation/selection/resizing."""
@@ -246,11 +257,19 @@ class ImageCanvas(QLabel):
         """Handle key press for box deletion."""
         if event.key() == Qt.Key.Key_Delete and self.selected_box_idx is not None:
             if 0 <= self.selected_box_idx < len(self.boxes):
-                removed_box = self.boxes.pop(self.selected_box_idx)
-                self.box_removed.emit(self.selected_box_idx)
+                removed_box = self.boxes[self.selected_box_idx]
+                # Emit the box_id if available for deletion by ID
+                if len(removed_box) == 6:
+                    box_id = removed_box[5]
+                    self.box_removed.emit(box_id)  # Emit box_id instead of index
+                    logger.debug(f"Box deleted by id: {box_id}")
+                else:
+                    self.box_removed.emit(self.selected_box_idx)  # Fallback to index
+                    logger.debug(f"Box deleted by index: {self.selected_box_idx}")
+                
+                self.boxes.pop(self.selected_box_idx)
                 self.selected_box_idx = None
                 self.update()
-                logger.debug(f"Box deleted: {removed_box}")
     
     def _find_box_at_position(self, pos: QPoint) -> Optional[int]:
         """Find box index at given position."""
@@ -272,7 +291,13 @@ class ImageCanvas(QLabel):
         img_height = scaled_size.height()
         
         # Check each box
-        for idx, (cls_id, x_c, y_c, w, h) in enumerate(self.boxes):
+        for idx, box in enumerate(self.boxes):
+            # Handle both 5 and 6 element boxes
+            if len(box) == 6:
+                cls_id, x_c, y_c, w, h, box_id = box
+            else:
+                cls_id, x_c, y_c, w, h = box
+                
             box_x = int((x_c - w/2) * img_width) + x_offset
             box_y = int((y_c - h/2) * img_height) + y_offset
             box_w = int(w * img_width)
@@ -285,7 +310,7 @@ class ImageCanvas(QLabel):
         return None
     
     def _pixel_rect_to_normalized_box(self, rect: QRect) -> Optional[Tuple]:
-        """Convert pixel rectangle to normalized YOLO box format."""
+        """Convert pixel rectangle to normalized YOLO box format (without ID - will be assigned later)."""
         if not self.current_pixmap or rect.width() < 5 or rect.height() < 5:
             return None
         
@@ -320,6 +345,7 @@ class ImageCanvas(QLabel):
         width = max(0.0, min(1.0, width))
         height = max(0.0, min(1.0, height))
         
+        # Return 5-element tuple (ID will be assigned by annotation manager)
         return (self.current_class_id, x_center, y_center, width, height)
     
     def _move_box(self, box_idx: int, delta: QPoint):
@@ -328,7 +354,12 @@ class ImageCanvas(QLabel):
             return
         
         # Get current box
-        cls_id, x_c, y_c, w, h = self.boxes[box_idx]
+        box = self.boxes[box_idx]
+        if len(box) == 6:
+            cls_id, x_c, y_c, w, h, box_id = box
+        else:
+            cls_id, x_c, y_c, w, h = box
+            box_id = None
         
         # Get image display dimensions
         widget_rect = self.rect()
@@ -355,8 +386,11 @@ class ImageCanvas(QLabel):
         new_x_c = max(w/2, min(1.0 - w/2, new_x_c))
         new_y_c = max(h/2, min(1.0 - h/2, new_y_c))
         
-        # Update box
-        self.boxes[box_idx] = (cls_id, new_x_c, new_y_c, w, h)
+        # Update box (preserve ID if exists)
+        if box_id is not None:
+            self.boxes[box_idx] = (cls_id, new_x_c, new_y_c, w, h, box_id)
+        else:
+            self.boxes[box_idx] = (cls_id, new_x_c, new_y_c, w, h)
         logger.debug(f"Box {box_idx} moved to ({new_x_c:.3f}, {new_y_c:.3f})")
     
     def _show_box_context_menu(self, pos: QPoint, box_idx: int):
@@ -384,26 +418,44 @@ class ImageCanvas(QLabel):
     def _change_box_class(self, box_idx: int, new_class_id: int):
         """Change the class of a bounding box."""
         if 0 <= box_idx < len(self.boxes):
-            cls_id, x_c, y_c, w, h = self.boxes[box_idx]
+            box = self.boxes[box_idx]
+            if len(box) == 6:
+                cls_id, x_c, y_c, w, h, box_id = box
+            else:
+                cls_id, x_c, y_c, w, h = box
+                box_id = None
+                
             old_class = self.box_classes.get(cls_id, f"Class {cls_id}")
             new_class = self.box_classes.get(new_class_id, f"Class {new_class_id}")
             
-            self.boxes[box_idx] = (new_class_id, x_c, y_c, w, h)
+            # Update box (preserve ID if exists)
+            if box_id is not None:
+                self.boxes[box_idx] = (new_class_id, x_c, y_c, w, h, box_id)
+            else:
+                self.boxes[box_idx] = (new_class_id, x_c, y_c, w, h)
             self.box_class_changed.emit(box_idx, new_class_id)
             self.update()
-            
+            self.last_used_class_id = new_class_id       
             logger.info(f"Box {box_idx} class changed from '{old_class}' to '{new_class}'")
     
     def _delete_box(self, box_idx: int):
         """Delete a bounding box from context menu."""
         if 0 <= box_idx < len(self.boxes):
             removed_box = self.boxes.pop(box_idx)
-            self.box_removed.emit(box_idx)
+            
+            # Emit box_id if available, otherwise index
+            if len(removed_box) == 6:
+                box_id = removed_box[5]
+                self.box_removed.emit(box_id)
+                class_name = self.box_classes.get(removed_box[0], f"Class {removed_box[0]}")
+                logger.info(f"Box deleted via context menu: {class_name} #{box_id}")
+            else:
+                self.box_removed.emit(box_idx)
+                class_name = self.box_classes.get(removed_box[0], f"Class {removed_box[0]}")
+                logger.info(f"Box deleted via context menu: {class_name}")
+            
             self.selected_box_idx = None
             self.update()
-            
-            class_name = self.box_classes.get(removed_box[0], f"Class {removed_box[0]}")
-            logger.info(f"Box deleted via context menu: {class_name}")
     
     def _find_box_corner_at_position(self, pos: QPoint, box_idx: int) -> Optional[str]:
         """Find which corner of a box is near the position (for resizing).
@@ -414,7 +466,11 @@ class ImageCanvas(QLabel):
         if not self.current_pixmap or box_idx >= len(self.boxes):
             return None
         
-        cls_id, x_c, y_c, w, h = self.boxes[box_idx]
+        box = self.boxes[box_idx]
+        if len(box) == 6:
+            cls_id, x_c, y_c, w, h, box_id = box
+        else:
+            cls_id, x_c, y_c, w, h = box
         
         # Get image display dimensions
         widget_rect = self.rect()
@@ -460,7 +516,11 @@ class ImageCanvas(QLabel):
             return
         
         # Get original box
-        cls_id, orig_x_c, orig_y_c, orig_w, orig_h = self.drag_box_original
+        if len(self.drag_box_original) == 6:
+            cls_id, orig_x_c, orig_y_c, orig_w, orig_h, box_id = self.drag_box_original
+        else:
+            cls_id, orig_x_c, orig_y_c, orig_w, orig_h = self.drag_box_original
+            box_id = None
         
         # Get image display dimensions
         widget_rect = self.rect()
@@ -515,8 +575,11 @@ class ImageCanvas(QLabel):
         new_x_c = max(new_w/2, min(1.0 - new_w/2, new_x_c))
         new_y_c = max(new_h/2, min(1.0 - new_h/2, new_y_c))
         
-        # Update box
-        self.boxes[box_idx] = (cls_id, new_x_c, new_y_c, new_w, new_h)
+        # Update box (preserve ID if exists)
+        if box_id is not None:
+            self.boxes[box_idx] = (cls_id, new_x_c, new_y_c, new_w, new_h, box_id)
+        else:
+            self.boxes[box_idx] = (cls_id, new_x_c, new_y_c, new_w, new_h)
         logger.debug(f"Box {box_idx} resized to ({new_w:.3f}, {new_h:.3f})")
     
     def copy_boxes(self):
@@ -531,13 +594,29 @@ class ImageCanvas(QLabel):
             logger.warning("No boxes in clipboard to paste")
             return 0
         
-        # Add all clipboard boxes to current frame
-        pasted_count = 0
-        for box in self.clipboard_boxes:
-            self.boxes.append(box)
-            self.box_added.emit(box)
-            pasted_count += 1
-        
-        self.update()
-        logger.info(f"Pasted {pasted_count} boxes from clipboard")
+        # Важно: не добавлять боксы напрямую в self.boxes!
+        # Вместо этого просто вернуть количество для статуса
+        pasted_count = len(self.clipboard_boxes)
+        self.update()  # Только обновить отображение, но не менять состояние
+        logger.info(f"Ready to paste {pasted_count} boxes (will be added via annotation manager)")
         return pasted_count
+
+    # def paste_boxes(self):
+    #     """Paste boxes from clipboard to current frame (without emitting signals).
+        
+    #     Note: This only updates the visual display. The main window is responsible
+    #     for adding boxes to the annotation manager.
+    #     """
+    #     if not self.clipboard_boxes:
+    #         logger.warning("No boxes in clipboard to paste")
+    #         return 0
+        
+    #     # Add all clipboard boxes to current frame (visual only)
+    #     pasted_count = 0
+    #     for box in self.clipboard_boxes:
+    #         self.boxes.append(box)
+    #         pasted_count += 1
+        
+    #     self.update()
+    #     logger.info(f"Pasted {pasted_count} boxes to canvas (visual only)")
+    #     return pasted_count

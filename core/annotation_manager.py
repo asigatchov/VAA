@@ -11,8 +11,9 @@ class AnnotationManager:
     def __init__(self):
         self.actions: List[Dict] = []  # List of action records
         self.current_action_start: Optional[Dict] = None  # Pending action (legacy)
-        self.yolo_boxes: Dict[int, List[Tuple]] = {}  # {frame_idx: [(cls, x, y, w, h), ...]}
+        self.yolo_boxes: Dict[int, Dict[int, Tuple]] = {}  # {frame_idx: {box_id: (cls, x, y, w, h)}}
         self.next_action_id = 1  # Auto-incrementing action ID
+        self.next_box_id = 1  # Auto-incrementing box ID
         
         # Auto-tracking: active actions by type
         self.active_actions: Dict[str, Dict] = {}  # {action_type: {start_frame, start_time, fps}}
@@ -142,46 +143,76 @@ class AnnotationManager:
         logger.warning(f"Action not found: ID {action_id}")
         return False
 
-    def add_yolo_box(self, frame_idx: int, box: Tuple[int, float, float, float, float], validate: bool = True):
+    def add_yolo_box(self, frame_idx: int, box: Tuple, validate: bool = True) -> int:
         """
         Add a YOLO bounding box to a frame.
         
         Args:
             frame_idx: Frame index
-            box: Tuple of (class_id, x_center, y_center, width, height) in normalized coords [0-1]
+            box: Tuple of (class_id, x_center, y_center, width, height)
             validate: Whether to validate and clamp coordinates
+            
+        Returns:
+            box_id: The ID assigned to this box
         """
+        cls_id, x, y, w, h = box[:5]
+            
         if validate:
-            cls_id, x, y, w, h = box
             # Clamp coordinates to [0, 1]
             x = max(0.0, min(1.0, x))
             y = max(0.0, min(1.0, y))
             w = max(0.0, min(1.0, w))
             h = max(0.0, min(1.0, h))
-            box = (cls_id, x, y, w, h)
-            
+        
+        # Initialize frame dict if needed
         if frame_idx not in self.yolo_boxes:
-            self.yolo_boxes[frame_idx] = []
-        self.yolo_boxes[frame_idx].append(box)
-        logger.debug(f"Box added to frame {frame_idx}: class={box[0]}")
+            self.yolo_boxes[frame_idx] = {}
+        
+        # Get unique box ID
+        box_id = self._get_unique_box_id(frame_idx)
+        
+        # Store box with ID as key
+        box_data = (cls_id, x, y, w, h)
+        self.yolo_boxes[frame_idx][box_id] = box_data
+        logger.debug(f"Box added to frame {frame_idx}: class={cls_id}, id={box_id}")
+        return box_id
 
     def remove_yolo_box(self, frame_idx: int, box_index: int) -> bool:
         """
-        Remove a specific bounding box from a frame.
+        Remove a specific bounding box from a frame by index (legacy support).
         
         Args:
             frame_idx: Frame index
-            box_index: Index of box in the frame's box list
+            box_index: Index of box in the frame's box dict (actually treated as box_id)
             
         Returns:
             True if removed, False if not found
         """
-        if frame_idx in self.yolo_boxes and 0 <= box_index < len(self.yolo_boxes[frame_idx]):
-            self.yolo_boxes[frame_idx].pop(box_index)
+        # Treat box_index as box_id for backward compatibility
+        return self.remove_yolo_box_by_id(frame_idx, box_index)
+    
+    def remove_yolo_box_by_id(self, frame_idx: int, box_id: int) -> bool:
+        """
+        Remove a specific bounding box from a frame by box ID.
+        
+        Args:
+            frame_idx: Frame index
+            box_id: Unique ID of the box
+            
+        Returns:
+            True if removed, False if not found
+        """
+        if frame_idx not in self.yolo_boxes:
+            return False
+        
+        if box_id in self.yolo_boxes[frame_idx]:
+            del self.yolo_boxes[frame_idx][box_id]
             if not self.yolo_boxes[frame_idx]:  # Remove frame entry if empty
                 del self.yolo_boxes[frame_idx]
-            logger.debug(f"Box removed from frame {frame_idx}, index {box_index}")
+            logger.debug(f"Box removed from frame {frame_idx} by id {box_id}")
             return True
+        
+        logger.warning(f"Box with id {box_id} not found in frame {frame_idx}")
         return False
     
     def clear_frame_boxes(self, frame_idx: int):
@@ -189,6 +220,27 @@ class AnnotationManager:
         if frame_idx in self.yolo_boxes:
             del self.yolo_boxes[frame_idx]
             logger.debug(f"All boxes cleared from frame {frame_idx}")
+    
+    def _get_unique_box_id(self, frame_idx: int) -> int:
+        """
+        Generate a unique box ID for the current frame.
+        
+        Args:
+            frame_idx: Frame index to check for existing IDs
+            
+        Returns:
+            Unique box ID
+        """
+        while True:
+            candidate_id = self.next_box_id
+            self.next_box_id += 1
+            
+            # Check if this ID is used in current frame
+            if frame_idx in self.yolo_boxes:
+                if candidate_id not in self.yolo_boxes[frame_idx]:
+                    return candidate_id
+            else:
+                return candidate_id
 
     def export_yolo(self, output_dir: str) -> int:
         """
@@ -210,9 +262,9 @@ class AnnotationManager:
                 
             path = os.path.join(labels_dir, f"{frame_idx:06d}.txt")
             with open(path, "w") as f:
-                for box in boxes:
+                for box_id, box_data in boxes.items():
                     # Format: class_id x_center y_center width height
-                    f.write(" ".join(map(str, box)) + "\n")
+                    f.write(" ".join(map(str, box_data)) + "\n")
             file_count += 1
             
         logger.info(f"YOLO export completed: {file_count} label files created in {labels_dir}")
@@ -260,7 +312,7 @@ class AnnotationManager:
             action_counts[action_type] = action_counts.get(action_type, 0) + 1
         
         total_frames_with_boxes = len(self.yolo_boxes)
-        total_boxes = sum(len(boxes) for boxes in self.yolo_boxes.values())
+        total_boxes = sum(len(box_dict) for box_dict in self.yolo_boxes.values())
         
         return {
             "total_actions": len(self.actions),

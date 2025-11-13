@@ -357,14 +357,15 @@ class VideoAnnotationApp(QMainWindow):
         self.show_boxes = (state == Qt.CheckState.Checked.value)
         self.canvas.toggle_boxes_visibility(self.show_boxes)
     
+   
     def on_class_selection_changed(self, index):
-        """Handle class selection change for drawing new boxes."""
         class_id = self.class_combo.itemData(index)
         if class_id is not None:
             self.canvas.set_current_class(class_id)
+            self.canvas.last_used_class_id = class_id
             class_name = self.annot_config.box_classes.get(class_id, f"Class {class_id}")
             self.status_bar.showMessage(f"Drawing class set to: {class_name}")
-    
+
     def update_display(self):
         """Update the canvas with current frame."""
         if not self.processor:
@@ -390,7 +391,9 @@ class VideoAnnotationApp(QMainWindow):
         pixmap = QPixmap.fromImage(qimg)
         
         # Get boxes for current frame
-        boxes = self.annotations.yolo_boxes.get(self.current_frame_idx, [])
+        boxes_dict = self.annotations.yolo_boxes.get(self.current_frame_idx, {})
+        # Convert dict {box_id: (cls, x, y, w, h)} to list [(cls, x, y, w, h, box_id), ...]
+        boxes = [(cls_id, x, y, w, h, box_id) for box_id, (cls_id, x, y, w, h) in boxes_dict.items()]
         
         # Update canvas
         self.canvas.set_image(pixmap, boxes)
@@ -475,32 +478,53 @@ class VideoAnnotationApp(QMainWindow):
                 self.timeline.set_actions(self.annotations.actions)
                 self.status_bar.showMessage("Action deleted")
     
+    
     def on_box_added(self, box):
         """Handle box added event from canvas."""
-        self.annotations.add_yolo_box(self.current_frame_idx, box)
-        self.status_bar.showMessage(f"Box added to frame {self.current_frame_idx}")
-        logger.debug(f"Box added: {box}")
+        box_id = self.annotations.add_yolo_box(self.current_frame_idx, box)
+        self.status_bar.showMessage(f"Box #{box_id} added to frame {self.current_frame_idx}")
+        logger.debug(f"Box added: {box}, assigned id={box_id}")
+        self.update_display()
     
-    def on_box_removed(self, box_index):
-        """Handle box removed event from canvas."""
-        self.annotations.remove_yolo_box(self.current_frame_idx, box_index)
-        self.status_bar.showMessage(f"Box removed from frame {self.current_frame_idx}")
-    
+    def on_box_removed(self, box_id_or_index):
+        """Handle box removed event from canvas.
+        
+        Args:
+            box_id_or_index: Can be box_id (int) for deletion by ID, or index for legacy support
+        """
+        # Try to remove by ID first (new behavior)
+        if self.annotations.remove_yolo_box_by_id(self.current_frame_idx, box_id_or_index):
+            self.status_bar.showMessage(f"Box #{box_id_or_index} removed from frame {self.current_frame_idx}")
+            logger.debug(f"Box removed by id: {box_id_or_index}")
+        # Fallback to index-based removal (legacy behavior)
+        elif self.annotations.remove_yolo_box(self.current_frame_idx, box_id_or_index):
+            self.status_bar.showMessage(f"Box removed from frame {self.current_frame_idx}")
+            logger.debug(f"Box removed by index: {box_id_or_index}")
+        else:
+            logger.warning(f"Failed to remove box {box_id_or_index} from frame {self.current_frame_idx}")
+        self.update_display()
+
+
+
     def on_box_class_changed(self, box_index: int, new_class_id: int):
         """Handle box class change event from canvas."""
         # Update the box in annotations
         if self.current_frame_idx in self.annotations.yolo_boxes:
-            boxes = self.annotations.yolo_boxes[self.current_frame_idx]
-            if 0 <= box_index < len(boxes):
-                old_box = boxes[box_index]
+            boxes_dict = self.annotations.yolo_boxes[self.current_frame_idx]
+            # Find box by index in the displayed list
+            box_ids = list(boxes_dict.keys())
+            if 0 <= box_index < len(box_ids):
+                box_id = box_ids[box_index]
+                old_box = boxes_dict[box_id]
                 # Update class while keeping coordinates
                 new_box = (new_class_id, old_box[1], old_box[2], old_box[3], old_box[4])
-                boxes[box_index] = new_box
+                boxes_dict[box_id] = new_box
                 
                 class_name = self.annot_config.box_classes.get(new_class_id, f"Class {new_class_id}")
-                self.status_bar.showMessage(f"Box class changed to {class_name}")
-                logger.info(f"Frame {self.current_frame_idx}, Box {box_index} class changed to {class_name}")
-    
+                self.status_bar.showMessage(f"Box #{box_id} class changed to {class_name}")
+                logger.info(f"Frame {self.current_frame_idx}, Box #{box_id} class changed to {class_name}")
+        self.update_display()
+        
     def copy_boxes(self):
         """Copy all boxes from current frame to clipboard (Ctrl+C)."""
         if not self.processor:
@@ -517,16 +541,29 @@ class VideoAnnotationApp(QMainWindow):
         if not self.processor:
             return
         
-        count = self.canvas.paste_boxes()
-        if count > 0:
-            # Add pasted boxes to annotations
-            for box in self.canvas.boxes[-count:]:  # Get last 'count' boxes
-                self.annotations.add_yolo_box(self.current_frame_idx, box)
-            
-            self.status_bar.showMessage(f"Pasted {count} boxes to frame {self.current_frame_idx}")
-            self.update_display()
-        else:
+        # Get clipboard boxes from canvas
+        clipboard_boxes = self.canvas.clipboard_boxes
+        if not clipboard_boxes:
             self.status_bar.showMessage("No boxes in clipboard to paste")
+            return
+        
+        # Add boxes directly to annotation manager with new unique IDs
+        pasted_ids = []
+        for box in clipboard_boxes:
+            # Strip old ID if present (will get new ID)
+            if len(box) == 6:
+                box_without_id = box[:5]
+            else:
+                box_without_id = box
+            
+            # Add box and get new unique ID
+            new_id = self.annotations.add_yolo_box(self.current_frame_idx, box_without_id)
+            pasted_ids.append(new_id)
+        
+        # Reload display to show pasted boxes
+        self.update_display()
+        self.status_bar.showMessage(f"Pasted {len(clipboard_boxes)} boxes to frame {self.current_frame_idx} (IDs: {', '.join(map(str, pasted_ids))})")
+        logger.info(f"Pasted {len(clipboard_boxes)} boxes to frame {self.current_frame_idx} with new IDs: {pasted_ids}")
     
     # Export methods
     
