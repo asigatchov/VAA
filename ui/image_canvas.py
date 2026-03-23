@@ -14,6 +14,8 @@ class ImageCanvas(QLabel):
     box_removed = pyqtSignal(int)  # Emits box index
     box_selected = pyqtSignal(int)  # Emits box index
     box_class_changed = pyqtSignal(int, int)  # Emits (box_index, new_class_id)
+    box_geometry_changed = pyqtSignal(int, float, float, float, float, int)  # box_index, x, y, w, h, box_id
+    ball_point_set = pyqtSignal(float, float)  # Emits normalized x, y
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -49,13 +51,16 @@ class ImageCanvas(QLabel):
         
         # Display settings
         self.show_boxes = True
+        self.show_ball = True
+        self.ball_markup_mode = False
+        self.ball_position: Optional[Tuple[float, float]] = None
         self.box_line_width = 2
         self.selected_line_width = 4
         
         # Enable mouse tracking
         self.setMouseTracking(True)
     
-    def set_image(self, pixmap: QPixmap, boxes: Optional[List[Tuple]] = None):
+    def set_image(self, pixmap: QPixmap, boxes: Optional[List[Tuple]] = None, ball_position: Optional[Tuple[float, float]] = None):
         """
         Set the image to display with optional bounding boxes.
         
@@ -65,6 +70,7 @@ class ImageCanvas(QLabel):
         """
         self.current_pixmap = pixmap
         self.boxes = boxes if boxes is not None else []
+        self.ball_position = ball_position
         self.selected_box_idx = None
         self.update()
     
@@ -85,6 +91,15 @@ class ImageCanvas(QLabel):
         """Toggle bounding box visibility."""
         self.show_boxes = visible
         self.update()
+
+    def toggle_ball_visibility(self, visible: bool):
+        """Toggle ball marker visibility."""
+        self.show_ball = visible
+        self.update()
+
+    def set_ball_markup_mode(self, enabled: bool):
+        """Enable or disable ball markup mode."""
+        self.ball_markup_mode = enabled
     
     def paintEvent(self, event):
         """Override paint event to draw image and bounding boxes."""
@@ -115,6 +130,9 @@ class ImageCanvas(QLabel):
         # Draw bounding boxes if enabled
         if self.show_boxes and self.boxes:
             self._draw_boxes(painter, x_offset, y_offset, scaled_pixmap.width(), scaled_pixmap.height())
+
+        if self.show_ball and self.ball_position is not None:
+            self._draw_ball_marker(painter, x_offset, y_offset, scaled_pixmap.width(), scaled_pixmap.height())
         
         # Draw current drawing box
         if self.is_drawing and self.draw_start and self.draw_end:
@@ -160,10 +178,31 @@ class ImageCanvas(QLabel):
                 label_text = class_name
             painter.setFont(painter.font())
             painter.drawText(box_x, box_y - 5, label_text)
+
+    def _draw_ball_marker(self, painter: QPainter, x_offset: int, y_offset: int, img_width: int, img_height: int):
+        """Draw the current ball position."""
+        if self.ball_position is None:
+            return
+
+        x_norm, y_norm = self.ball_position
+        ball_x = int(x_norm * img_width) + x_offset
+        ball_y = int(y_norm * img_height) + y_offset
+        painter.setPen(QPen(QColor("#FFD60A"), 2))
+        painter.setBrush(QColor("#FFD60A"))
+        painter.drawEllipse(QPoint(ball_x, ball_y), 5, 5)
+        painter.drawText(ball_x + 8, ball_y - 8, "Ball")
     
     def mousePressEvent(self, event: QMouseEvent):
         """Handle mouse press for box creation/selection/resizing."""
         pos = event.pos()
+
+        if event.button() == Qt.MouseButton.LeftButton and self.ball_markup_mode:
+            ball_point = self._point_to_normalized(pos)
+            if ball_point is not None:
+                self.ball_position = ball_point
+                self.ball_point_set.emit(ball_point[0], ball_point[1])
+                self.update()
+            return
         
         # Check if clicking on existing box
         clicked_box_idx = self._find_box_at_position(pos)
@@ -173,6 +212,12 @@ class ImageCanvas(QLabel):
             if clicked_box_idx is not None:
                 self.selected_box_idx = clicked_box_idx
                 self._show_box_context_menu(pos, clicked_box_idx)
+            return
+
+        if event.button() == Qt.MouseButton.MiddleButton:
+            if clicked_box_idx is not None:
+                self.selected_box_idx = clicked_box_idx
+                self._delete_box(clicked_box_idx)
             return
         
         if event.button() != Qt.MouseButton.LeftButton:
@@ -252,6 +297,13 @@ class ImageCanvas(QLabel):
         self.is_resizing = False
         self.resize_mode = None
         self.drag_start = None
+        self.drag_box_original = None
+
+        if self.selected_box_idx is not None and 0 <= self.selected_box_idx < len(self.boxes):
+            box = self.boxes[self.selected_box_idx]
+            if len(box) == 6:
+                cls_id, x_c, y_c, w, h, box_id = box
+                self.box_geometry_changed.emit(self.selected_box_idx, x_c, y_c, w, h, box_id)
     
     def keyPressEvent(self, event):
         """Handle key press for box deletion."""
@@ -347,6 +399,35 @@ class ImageCanvas(QLabel):
         
         # Return 5-element tuple (ID will be assigned by annotation manager)
         return (self.current_class_id, x_center, y_center, width, height)
+
+    def _point_to_normalized(self, pos: QPoint) -> Optional[Tuple[float, float]]:
+        """Convert widget coordinates to normalized image coordinates."""
+        if not self.current_pixmap:
+            return None
+
+        widget_rect = self.rect()
+        scaled_size = self.current_pixmap.scaled(
+            widget_rect.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        ).size()
+
+        x_offset = (widget_rect.width() - scaled_size.width()) // 2
+        y_offset = (widget_rect.height() - scaled_size.height()) // 2
+        img_width = scaled_size.width()
+        img_height = scaled_size.height()
+        if img_width <= 0 or img_height <= 0:
+            return None
+
+        x = pos.x() - x_offset
+        y = pos.y() - y_offset
+        if x < 0 or y < 0 or x > img_width or y > img_height:
+            return None
+
+        return (
+            max(0.0, min(1.0, x / img_width)),
+            max(0.0, min(1.0, y / img_height)),
+        )
     
     def _move_box(self, box_idx: int, delta: QPoint):
         """Move a bounding box by delta pixels."""

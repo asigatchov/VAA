@@ -22,17 +22,15 @@ class AnnotationConfig:
     
     # Action types (6 volleyball actions)
     action_types: Tuple[str, ...] = (
-        "Serve", "Reception", "Set", "Attack", "Block", "Dig"
+        "Serve", "Receive", "Set", "Attack"
     )
     
     # Box classes (action types as classes)
     box_classes: Dict[int, str] = field(default_factory=lambda: {
         0: "Serve",
-        1: "Reception",
+        1: "Receive",
         2: "Set",
         3: "Attack",
-        4: "Block",
-        5: "Dig"
     })
 
 
@@ -55,11 +53,9 @@ class UIConfig:
     # Box colors (class_id -> color) - matches action types
     box_colors: Dict[int, str] = field(default_factory=lambda: {
         0: "#FF6B6B",    # Serve
-        1: "#4ECDC4",    # Reception
+        1: "#4ECDC4",    # Receive
         2: "#45B7D1",    # Set
         3: "#FFA07A",    # Attack
-        4: "#98D8C8",    # Block
-        5: "#F7DC6F"     # Dig
     })
     selected_box_color: str = "#00FF00"
     box_line_width: int = 2
@@ -71,12 +67,11 @@ class UIConfig:
     
     # Action type colors
     action_colors: Dict[str, str] = field(default_factory=lambda: {
+        "Rally": "#B8C0FF",
         "Serve": "#FF6B6B",
-        "Reception": "#4ECDC4",
+        "Receive": "#4ECDC4",
         "Set": "#45B7D1",
         "Attack": "#FFA07A",
-        "Block": "#98D8C8",
-        "Dig": "#F7DC6F"
     })
     
     # UI language

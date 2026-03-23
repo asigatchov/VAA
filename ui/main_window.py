@@ -1,10 +1,14 @@
 """Main window for VAA application."""
 from typing import Optional
+import csv
+import json
+from pathlib import Path
+from datetime import datetime
 import cv2
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QFileDialog, QMessageBox, QLabel, QPushButton,
-    QCheckBox, QMenuBar, QMenu, QStatusBar
+    QStatusBar
 )
 from PyQt6.QtCore import QTimer, Qt, pyqtSlot
 from PyQt6.QtGui import QAction, QKeySequence, QImage, QPixmap
@@ -32,8 +36,17 @@ class VideoAnnotationApp(QMainWindow):
         
         # Core components
         self.processor: Optional[VideoProcessor] = None
-        self.annotations = AnnotationManager()
+        self.annotations = AnnotationManager(self.annot_config.box_classes)
         self.yolo_tracker: Optional[YOLOTracker] = None
+        self.projects_dir = Path(__file__).resolve().parents[1] / "projects"
+        self.current_project_dir: Optional[Path] = None
+        self.current_project_json: Optional[Path] = None
+        self.current_video_path: Optional[Path] = None
+        self.current_ball_csv_path: Optional[Path] = None
+        self.current_action4_json_path: Optional[Path] = None
+        self.current_ball_data = []
+        self.current_ball_lookup = {}
+        self.selected_rally_id: Optional[int] = None
         
         # State
         self.current_frame_idx = 0
@@ -77,39 +90,52 @@ class VideoAnnotationApp(QMainWindow):
         self.canvas.box_added.connect(self.on_box_added)
         self.canvas.box_removed.connect(self.on_box_removed)
         self.canvas.box_class_changed.connect(self.on_box_class_changed)
+        self.canvas.box_geometry_changed.connect(self.on_box_geometry_changed)
+        self.canvas.ball_point_set.connect(self.on_ball_point_set)
         left_panel.addWidget(self.canvas, stretch=1)
         
         # Control bar
         control_bar = QHBoxLayout()
         
-        self.load_btn = QPushButton("📁 Load Video")
-        self.load_btn.clicked.connect(self.load_video)
-        control_bar.addWidget(self.load_btn)
-        
-        self.play_btn = QPushButton("▶ Play")
+        self.jump_back_btn = QPushButton("<<")
+        self.jump_back_btn.clicked.connect(lambda: self.step_frames(-15))
+        self.jump_back_btn.setEnabled(False)
+        control_bar.addWidget(self.jump_back_btn)
+
+        self.prev_btn = QPushButton("<")
+        self.prev_btn.clicked.connect(lambda: self.step_frames(-1))
+        self.prev_btn.setEnabled(False)
+        control_bar.addWidget(self.prev_btn)
+
+        self.play_btn = QPushButton("Play")
         self.play_btn.clicked.connect(self.toggle_play)
         self.play_btn.setEnabled(False)
         control_bar.addWidget(self.play_btn)
-        
-        self.prev_btn = QPushButton("|◀ Prev")
-        self.prev_btn.clicked.connect(self.prev_frame)
-        self.prev_btn.setEnabled(False)
-        control_bar.addWidget(self.prev_btn)
-        
-        self.next_btn = QPushButton("▶| Next")
-        self.next_btn.clicked.connect(self.next_frame)
+
+        self.next_btn = QPushButton(">")
+        self.next_btn.clicked.connect(lambda: self.step_frames(1))
         self.next_btn.setEnabled(False)
         control_bar.addWidget(self.next_btn)
-        
-        self.superframe_cb = QCheckBox("Show Superframe")
-        self.superframe_cb.setChecked(self.show_superframe)
-        self.superframe_cb.stateChanged.connect(self.toggle_superframe)
-        control_bar.addWidget(self.superframe_cb)
-        
-        self.boxes_cb = QCheckBox("Show Boxes")
-        self.boxes_cb.setChecked(self.show_boxes)
-        self.boxes_cb.stateChanged.connect(self.toggle_boxes)
-        control_bar.addWidget(self.boxes_cb)
+
+        self.jump_forward_btn = QPushButton(">>")
+        self.jump_forward_btn.clicked.connect(lambda: self.step_frames(15))
+        self.jump_forward_btn.setEnabled(False)
+        control_bar.addWidget(self.jump_forward_btn)
+
+        self.rally_start_btn = QPushButton("[")
+        self.rally_start_btn.clicked.connect(self.start_rally)
+        self.rally_start_btn.setEnabled(False)
+        control_bar.addWidget(self.rally_start_btn)
+
+        self.rally_end_btn = QPushButton("]")
+        self.rally_end_btn.clicked.connect(self.end_rally)
+        self.rally_end_btn.setEnabled(False)
+        control_bar.addWidget(self.rally_end_btn)
+
+        self.rally_split_btn = QPushButton("|")
+        self.rally_split_btn.clicked.connect(self.split_rally_at_current_frame)
+        self.rally_split_btn.setEnabled(False)
+        control_bar.addWidget(self.rally_split_btn)
         
         # Add class selector for drawing
         control_bar.addWidget(QLabel("Draw Class:"))
@@ -128,7 +154,7 @@ class VideoAnnotationApp(QMainWindow):
         self.frame_label.setStyleSheet("font-family: monospace; font-size: 12px;")
         control_bar.addWidget(self.frame_label)
         
-        control_bar.addStretch()
+        control_bar.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         left_panel.addLayout(control_bar)
         
         # Timeline
@@ -136,15 +162,22 @@ class VideoAnnotationApp(QMainWindow):
         self.timeline.set_action_colors(self.ui_config.action_colors)
         self.timeline.position_changed.connect(self.seek)
         left_panel.addWidget(self.timeline)
+
+        self.detail_timeline = TimelineWidget(detail_mode=True)
+        self.detail_timeline.set_action_colors(self.ui_config.action_colors)
+        self.detail_timeline.position_changed.connect(self.seek)
+        left_panel.addWidget(self.detail_timeline)
         
         main_layout.addLayout(left_panel, stretch=7)
         
         # Right panel - Action controls
         self.action_panel = ActionPanel(list(self.annot_config.action_types))
-        self.action_panel.start_action_requested.connect(self.start_action)
-        self.action_panel.end_action_requested.connect(self.end_action)
-        self.action_panel.action_deleted.connect(self.delete_action)
-        self.action_panel.seek_to_action.connect(self.seek)
+        self.action_panel.start_rally_requested.connect(self.start_rally)
+        self.action_panel.end_rally_requested.connect(self.end_rally)
+        self.action_panel.action_type_selected.connect(self.on_action_type_selected)
+        self.action_panel.rally_deleted.connect(self.delete_rally)
+        self.action_panel.rally_selected.connect(self.on_rally_selected)
+        self.action_panel.seek_to_rally.connect(self.seek)
         
         right_panel = QVBoxLayout()
         right_panel.addWidget(self.action_panel)
@@ -170,9 +203,13 @@ class VideoAnnotationApp(QMainWindow):
         open_action.triggered.connect(self.load_video)
         file_menu.addAction(open_action)
         
-        save_action = QAction("&Save Annotations", self)
+        load_project_action = QAction("&Load Project...", self)
+        load_project_action.triggered.connect(self.load_project)
+        file_menu.addAction(load_project_action)
+
+        save_action = QAction("&Save Project", self)
         save_action.setShortcut(QKeySequence.StandardKey.Save)
-        save_action.triggered.connect(self.export_annotations)
+        save_action.triggered.connect(self.save_project)
         file_menu.addAction(save_action)
         
         file_menu.addSeparator()
@@ -182,28 +219,40 @@ class VideoAnnotationApp(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
         
-        # View menu
-        view_menu = menubar.addMenu("&View")
-        
-        toggle_superframe_action = QAction("Toggle &Superframe", self)
-        toggle_superframe_action.setShortcut("F1")
-        toggle_superframe_action.triggered.connect(lambda: self.superframe_cb.toggle())
-        view_menu.addAction(toggle_superframe_action)
-        
-        toggle_boxes_action = QAction("Toggle &Bounding Boxes", self)
-        toggle_boxes_action.setShortcut("F2")
-        toggle_boxes_action.triggered.connect(lambda: self.boxes_cb.toggle())
-        view_menu.addAction(toggle_boxes_action)
-        
         # Annotation menu
         annot_menu = menubar.addMenu("&Annotation")
+
+        toggle_superframe_action = QAction("Show &Superframe", self)
+        toggle_superframe_action.setShortcut("F1")
+        toggle_superframe_action.setCheckable(True)
+        toggle_superframe_action.setChecked(self.show_superframe)
+        toggle_superframe_action.triggered.connect(lambda checked: self.toggle_superframe(Qt.CheckState.Checked.value if checked else Qt.CheckState.Unchecked.value))
+        annot_menu.addAction(toggle_superframe_action)
         
-        start_action_act = QAction("&Start Action", self)
+        toggle_boxes_action = QAction("Show &Bounding Boxes", self)
+        toggle_boxes_action.setShortcut("F2")
+        toggle_boxes_action.setCheckable(True)
+        toggle_boxes_action.setChecked(self.show_boxes)
+        toggle_boxes_action.triggered.connect(lambda checked: self.toggle_boxes(Qt.CheckState.Checked.value if checked else Qt.CheckState.Unchecked.value))
+        annot_menu.addAction(toggle_boxes_action)
+
+        toggle_ball_action = QAction("Show &Ball", self)
+        toggle_ball_action.setCheckable(True)
+        toggle_ball_action.setChecked(True)
+        toggle_ball_action.triggered.connect(lambda checked: self.toggle_ball(Qt.CheckState.Checked.value if checked else Qt.CheckState.Unchecked.value))
+        annot_menu.addAction(toggle_ball_action)
+
+        mark_ball_action = QAction("&Mark Ball", self)
+        mark_ball_action.setCheckable(True)
+        mark_ball_action.triggered.connect(lambda checked: self.toggle_ball_markup(Qt.CheckState.Checked.value if checked else Qt.CheckState.Unchecked.value))
+        annot_menu.addAction(mark_ball_action)
+        
+        start_action_act = QAction("&Start Rally", self)
         start_action_act.setShortcut("Return")
         start_action_act.triggered.connect(self.action_panel.start_btn.click)
         annot_menu.addAction(start_action_act)
         
-        end_action_act = QAction("&End Action", self)
+        end_action_act = QAction("&End Rally", self)
         end_action_act.setShortcut("Shift+Return")
         end_action_act.triggered.connect(self.action_panel.end_btn.click)
         annot_menu.addAction(end_action_act)
@@ -225,13 +274,48 @@ class VideoAnnotationApp(QMainWindow):
         
         prev_shortcut = QAction(self)
         prev_shortcut.setShortcut("Left")
-        prev_shortcut.triggered.connect(self.prev_frame)
+        prev_shortcut.triggered.connect(lambda: self.step_frames(-1))
         self.addAction(prev_shortcut)
         
         next_shortcut = QAction(self)
         next_shortcut.setShortcut("Right")
-        next_shortcut.triggered.connect(self.next_frame)
+        next_shortcut.triggered.connect(lambda: self.step_frames(1))
         self.addAction(next_shortcut)
+
+        step_back_shortcut = QAction(self)
+        step_back_shortcut.setShortcut("A")
+        step_back_shortcut.triggered.connect(lambda: self.step_frames(-1))
+        self.addAction(step_back_shortcut)
+
+        step_forward_shortcut = QAction(self)
+        step_forward_shortcut.setShortcut("D")
+        step_forward_shortcut.triggered.connect(lambda: self.step_frames(1))
+        self.addAction(step_forward_shortcut)
+
+        jump_back_shortcut = QAction(self)
+        jump_back_shortcut.setShortcut("S")
+        jump_back_shortcut.triggered.connect(lambda: self.step_frames(-15))
+        self.addAction(jump_back_shortcut)
+
+        jump_forward_shortcut = QAction(self)
+        jump_forward_shortcut.setShortcut("W")
+        jump_forward_shortcut.triggered.connect(lambda: self.step_frames(15))
+        self.addAction(jump_forward_shortcut)
+
+        rally_start_shortcut = QAction(self)
+        rally_start_shortcut.setShortcut("[")
+        rally_start_shortcut.triggered.connect(self.start_rally)
+        self.addAction(rally_start_shortcut)
+
+        rally_end_shortcut = QAction(self)
+        rally_end_shortcut.setShortcut("]")
+        rally_end_shortcut.triggered.connect(self.end_rally)
+        self.addAction(rally_end_shortcut)
+
+        split_rally_shortcut = QAction(self)
+        split_rally_shortcut.setShortcut("|")
+        split_rally_shortcut.triggered.connect(self.split_rally_at_current_frame)
+        self.addAction(split_rally_shortcut)
         
         home_shortcut = QAction(self)
         home_shortcut.setShortcut("Home")
@@ -269,35 +353,7 @@ class VideoAnnotationApp(QMainWindow):
             return
         
         try:
-            # Release existing processor
-            if self.processor:
-                self.processor.release()
-            
-            # Load new video
-            self.processor = VideoProcessor(
-                file_path,
-                target_size=self.annot_config.target_resolution,
-                cache_limit=self.annot_config.cache_limit_frames
-            )
-            
-            # Reset state
-            self.current_frame_idx = 0
-            self.is_playing = False
-            self.annotations = AnnotationManager()
-            
-            # Update UI
-            self.timeline.set_total_frames(self.processor.total_frames)
-            self.timeline.set_current_frame(0)
-            self.play_btn.setEnabled(True)
-            self.prev_btn.setEnabled(True)
-            self.next_btn.setEnabled(True)
-            self.export_btn.setEnabled(True)
-            
-            # Display first frame
-            self.update_display()
-            
-            self.status_bar.showMessage(f"Loaded: {file_path} | {self.processor.total_frames} frames @ {self.processor.fps:.2f} fps")
-            logger.info(f"Video loaded successfully: {file_path}")
+            self._open_video_with_project(Path(file_path))
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load video:\n{str(e)}")
@@ -312,25 +368,30 @@ class VideoAnnotationApp(QMainWindow):
         
         if self.is_playing:
             self.timer.start()
-            self.play_btn.setText("⏸ Pause")
+            self.play_btn.setText("Pause")
             self.status_bar.showMessage("Playing...")
         else:
             self.timer.stop()
-            self.play_btn.setText("▶ Play")
+            self.play_btn.setText("Play")
             self.status_bar.showMessage("Paused")
     
     def prev_frame(self):
         """Go to previous frame."""
-        if self.processor and self.current_frame_idx > 0:
-            self.seek(self.current_frame_idx - 1)
+        self.step_frames(-1)
     
     def next_frame(self):
         """Go to next frame."""
         if self.processor and self.current_frame_idx < self.processor.total_frames - 1:
-            self.seek(self.current_frame_idx + 1)
+            self.step_frames(1)
         elif self.is_playing:
             # Stop playback at end
             self.toggle_play()
+
+    def step_frames(self, offset: int):
+        """Move current position by frame offset."""
+        if not self.processor:
+            return
+        self.seek(self.current_frame_idx + offset)
     
     def seek(self, frame_idx: int):
         """Seek to specific frame."""
@@ -339,6 +400,7 @@ class VideoAnnotationApp(QMainWindow):
         
         self.current_frame_idx = max(0, min(frame_idx, self.processor.total_frames - 1))
         self.timeline.set_current_frame(self.current_frame_idx)
+        self.detail_timeline.set_current_frame(self.current_frame_idx)
         self.update_display()
     
     def update_timer_interval(self):
@@ -356,6 +418,18 @@ class VideoAnnotationApp(QMainWindow):
         """Toggle bounding box visibility."""
         self.show_boxes = (state == Qt.CheckState.Checked.value)
         self.canvas.toggle_boxes_visibility(self.show_boxes)
+
+    def toggle_ball(self, state):
+        """Toggle ball marker visibility."""
+        self.canvas.toggle_ball_visibility(state == Qt.CheckState.Checked.value)
+
+    def toggle_ball_markup(self, state):
+        """Toggle manual ball markup mode."""
+        enabled = (state == Qt.CheckState.Checked.value)
+        self.canvas.set_ball_markup_mode(enabled)
+        self.status_bar.showMessage(
+            "Ball markup mode enabled: click frame to set ball position" if enabled else "Ball markup mode disabled"
+        )
     
    
     def on_class_selection_changed(self, index):
@@ -365,6 +439,18 @@ class VideoAnnotationApp(QMainWindow):
             self.canvas.last_used_class_id = class_id
             class_name = self.annot_config.box_classes.get(class_id, f"Class {class_id}")
             self.status_bar.showMessage(f"Drawing class set to: {class_name}")
+
+    def on_action_type_selected(self, action_type: str):
+        """Sync action flow selection with draw class selector."""
+        combo_index = self.class_combo.findText(action_type)
+        if combo_index >= 0 and combo_index != self.class_combo.currentIndex():
+            self.class_combo.setCurrentIndex(combo_index)
+        self.status_bar.showMessage(f"Selected rally step: {action_type}")
+
+    def on_rally_selected(self, rally_id: int):
+        """Track selected rally for detail timeline."""
+        self.selected_rally_id = rally_id if rally_id >= 0 else None
+        self._update_detail_timeline()
 
     def update_display(self):
         """Update the canvas with current frame."""
@@ -396,10 +482,11 @@ class VideoAnnotationApp(QMainWindow):
         boxes = [(cls_id, x, y, w, h, box_id) for box_id, (cls_id, x, y, w, h) in boxes_dict.items()]
         
         # Update canvas
-        self.canvas.set_image(pixmap, boxes)
+        self.canvas.set_image(pixmap, boxes, self._get_current_ball_position_normalized())
         
         # Update info labels
         self.update_info_labels()
+        self._update_detail_timeline()
     
     def update_info_labels(self):
         """Update time and frame information labels."""
@@ -425,63 +512,91 @@ class VideoAnnotationApp(QMainWindow):
     
     # Annotation methods
     
-    def start_action(self, action_type: str):
-        """Start a new action annotation."""
+    def start_rally(self):
+        """Start a new rally annotation."""
         if not self.processor:
             return
         
-        success = self.annotations.start_action(
+        success = self.annotations.start_rally(
             self.current_frame_idx,
-            action_type,
             self.processor.fps
         )
         
         if success:
-            self.status_bar.showMessage(f"Action started: {action_type}")
+            self._save_project_state()
+            self.status_bar.showMessage(f"Rally started at frame {self.current_frame_idx}")
         else:
             QMessageBox.warning(
                 self,
-                "Action Already Started",
-                "Please end the current action before starting a new one."
+                "Rally Already Started",
+                "Please end the current rally before starting a new one."
             )
     
-    def end_action(self):
-        """End the current action annotation."""
+    def end_rally(self):
+        """End the current rally annotation."""
         if not self.processor:
             return
         
-        action = self.annotations.end_action(self.current_frame_idx)
+        rally = self.annotations.end_rally(self.current_frame_idx)
         
-        if action:
-            self.action_panel.set_actions(self.annotations.actions)
-            self.timeline.set_actions(self.annotations.actions)
-            self.status_bar.showMessage(f"Action completed: {action['type']}")
+        if rally:
+            self.action_panel.set_rallies(self.annotations.rallies)
+            self.timeline.set_actions(self.annotations.get_timeline_items())
+            self._update_detail_timeline()
+            self._save_project_state()
+            self.status_bar.showMessage(
+                f"Rally completed: {rally['start_frame']} - {rally['end_frame']}"
+            )
         else:
             QMessageBox.warning(
                 self,
-                "No Action to End",
-                "Please start an action first."
+                "No Rally to End",
+                "Please start a rally first."
             )
     
-    def delete_action(self, action_id: int):
-        """Delete an action."""
+    def delete_rally(self, rally_id: int):
+        """Delete a rally."""
         reply = QMessageBox.question(
             self,
-            "Delete Action",
-            "Are you sure you want to delete this action?",
+            "Delete Rally",
+            "Are you sure you want to delete this rally?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         
         if reply == QMessageBox.StandardButton.Yes:
-            if self.annotations.delete_action(action_id):
-                self.action_panel.set_actions(self.annotations.actions)
-                self.timeline.set_actions(self.annotations.actions)
-                self.status_bar.showMessage("Action deleted")
+            if self.annotations.delete_rally(rally_id):
+                self.action_panel.set_rallies(self.annotations.rallies)
+                self.timeline.set_actions(self.annotations.get_timeline_items())
+                self._update_detail_timeline()
+                self._save_project_state()
+                self.status_bar.showMessage("Rally deleted")
+
+    def split_rally_at_current_frame(self):
+        """Split the rally containing the current frame into two rallies."""
+        if not self.processor:
+            return
+
+        if self.annotations.split_rally(self.current_frame_idx):
+            self.action_panel.set_rallies(self.annotations.rallies)
+            self.timeline.set_actions(self.annotations.get_timeline_items())
+            self._update_detail_timeline()
+            self._save_project_state()
+            self.status_bar.showMessage(f"Rally split at frame {self.current_frame_idx}")
+        else:
+            QMessageBox.warning(
+                self,
+                "Split Rally",
+                "Current frame must be inside an existing rally, not at its boundary."
+            )
     
     
     def on_box_added(self, box):
         """Handle box added event from canvas."""
         box_id = self.annotations.add_yolo_box(self.current_frame_idx, box)
+        self.action_panel.set_rallies(self.annotations.rallies)
+        self.timeline.set_actions(self.annotations.get_timeline_items())
+        self._update_detail_timeline()
+        self._save_project_state()
         self.status_bar.showMessage(f"Box #{box_id} added to frame {self.current_frame_idx}")
         logger.debug(f"Box added: {box}, assigned id={box_id}")
         self.update_display()
@@ -502,6 +617,10 @@ class VideoAnnotationApp(QMainWindow):
             logger.debug(f"Box removed by index: {box_id_or_index}")
         else:
             logger.warning(f"Failed to remove box {box_id_or_index} from frame {self.current_frame_idx}")
+        self.action_panel.set_rallies(self.annotations.rallies)
+        self.timeline.set_actions(self.annotations.get_timeline_items())
+        self._update_detail_timeline()
+        self._save_project_state()
         self.update_display()
 
 
@@ -515,14 +634,60 @@ class VideoAnnotationApp(QMainWindow):
             box_ids = list(boxes_dict.keys())
             if 0 <= box_index < len(box_ids):
                 box_id = box_ids[box_index]
-                old_box = boxes_dict[box_id]
-                # Update class while keeping coordinates
-                new_box = (new_class_id, old_box[1], old_box[2], old_box[3], old_box[4])
-                boxes_dict[box_id] = new_box
+                self.annotations.update_box_class(self.current_frame_idx, box_id, new_class_id)
                 
                 class_name = self.annot_config.box_classes.get(new_class_id, f"Class {new_class_id}")
                 self.status_bar.showMessage(f"Box #{box_id} class changed to {class_name}")
                 logger.info(f"Frame {self.current_frame_idx}, Box #{box_id} class changed to {class_name}")
+        self.action_panel.set_rallies(self.annotations.rallies)
+        self.timeline.set_actions(self.annotations.get_timeline_items())
+        self._update_detail_timeline()
+        self._save_project_state()
+        self.update_display()
+
+    def on_box_geometry_changed(
+        self,
+        box_index: int,
+        x_center: float,
+        y_center: float,
+        width: float,
+        height: float,
+        box_id: int,
+    ):
+        """Persist moved/resized box geometry from canvas back to annotation manager."""
+        if self.current_frame_idx not in self.annotations.yolo_boxes:
+            return
+
+        boxes_dict = self.annotations.yolo_boxes[self.current_frame_idx]
+        if box_id not in boxes_dict:
+            return
+
+        class_id = int(boxes_dict[box_id][0])
+        updated = self.annotations.update_box_geometry(
+            self.current_frame_idx,
+            box_id,
+            class_id,
+            x_center,
+            y_center,
+            width,
+            height,
+        )
+        if updated:
+            self.action_panel.set_rallies(self.annotations.rallies)
+            self.timeline.set_actions(self.annotations.get_timeline_items())
+            self._update_detail_timeline()
+            self._save_project_state()
+
+    def on_ball_point_set(self, x_norm: float, y_norm: float):
+        """Persist clicked ball point in source-frame coordinates."""
+        if not self.processor:
+            return
+
+        source_x = int(round(x_norm * self.processor.width))
+        source_y = int(round(y_norm * self.processor.height))
+        self._upsert_ball_point(self.current_frame_idx, source_x, source_y)
+        self._save_project_state()
+        self.status_bar.showMessage(f"Ball marked at frame {self.current_frame_idx}: ({source_x}, {source_y})")
         self.update_display()
         
     def copy_boxes(self):
@@ -561,6 +726,10 @@ class VideoAnnotationApp(QMainWindow):
             pasted_ids.append(new_id)
         
         # Reload display to show pasted boxes
+        self.action_panel.set_rallies(self.annotations.rallies)
+        self.timeline.set_actions(self.annotations.get_timeline_items())
+        self._update_detail_timeline()
+        self._save_project_state()
         self.update_display()
         self.status_bar.showMessage(f"Pasted {len(clipboard_boxes)} boxes to frame {self.current_frame_idx} (IDs: {', '.join(map(str, pasted_ids))})")
         logger.info(f"Pasted {len(clipboard_boxes)} boxes to frame {self.current_frame_idx} with new IDs: {pasted_ids}")
@@ -575,7 +744,7 @@ class VideoAnnotationApp(QMainWindow):
         
         # Check if there are annotations
         stats = self.annotations.get_statistics()
-        if stats["total_actions"] == 0 and stats["total_boxes"] == 0:
+        if stats["total_rallies"] == 0 and stats["total_boxes"] == 0:
             reply = QMessageBox.question(
                 self,
                 "No Annotations",
@@ -589,7 +758,7 @@ class VideoAnnotationApp(QMainWindow):
         output_dir = QFileDialog.getExistingDirectory(
             self,
             "Select Export Directory",
-            ""
+            str(self.current_project_dir) if self.current_project_dir else ""
         )
         
         if not output_dir:
@@ -610,12 +779,12 @@ class VideoAnnotationApp(QMainWindow):
                 "Export Complete",
                 f"Annotations exported successfully!\n\n"
                 f"YOLO labels: {label_count} files\n"
-                f"Actions: {action_count} items\n\n"
+                f"Rallies: {action_count} items\n\n"
                 f"Location: {output_dir}"
             )
             
             self.status_bar.showMessage(f"Export complete: {output_dir}")
-            logger.info(f"Export successful: {label_count} labels, {action_count} actions")
+            logger.info(f"Export successful: {label_count} labels, {action_count} rallies")
             
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Failed to export annotations:\n{str(e)}")
@@ -641,7 +810,7 @@ class VideoAnnotationApp(QMainWindow):
     def closeEvent(self, event):
         """Handle window close event."""
         # Check for unsaved annotations
-        if self.annotations.actions or self.annotations.yolo_boxes:
+        if self.annotations.rallies or self.annotations.yolo_boxes:
             reply = QMessageBox.question(
                 self,
                 "Unsaved Annotations",
@@ -659,3 +828,300 @@ class VideoAnnotationApp(QMainWindow):
         
         logger.info("Application closed")
         event.accept()
+
+    def save_project(self):
+        """Save current project JSON."""
+        if not self.current_project_json:
+            QMessageBox.warning(self, "No Project", "Please load a video or project first.")
+            return
+
+        self._save_project_state()
+        self.status_bar.showMessage(f"Project saved: {self.current_project_json}")
+
+    def load_project(self):
+        """Load an existing project JSON."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Project",
+            str(self.projects_dir),
+            "Project Files (*.json);;All Files (*)"
+        )
+        if not file_path:
+            return
+
+        project_json = Path(file_path)
+        with open(project_json, "r", encoding="utf-8") as file_obj:
+            project_data = json.load(file_obj)
+
+        video_path = Path(project_data["video_path"])
+        if not video_path.exists():
+            QMessageBox.critical(self, "Load Project Error", f"Video file not found:\n{video_path}")
+            return
+
+        self._open_video_with_project(video_path, project_json)
+
+    def _open_video_with_project(self, video_path: Path, project_json: Optional[Path] = None):
+        """Open a video file and optionally load a specific project JSON."""
+        if self.processor:
+            self.processor.release()
+
+        self.processor = VideoProcessor(
+            str(video_path),
+            target_size=self.annot_config.target_resolution,
+            cache_limit=self.annot_config.cache_limit_frames
+        )
+
+        self.current_frame_idx = 0
+        self.is_playing = False
+        self.annotations = AnnotationManager(self.annot_config.box_classes)
+        self.current_ball_data = []
+        self.current_ball_lookup = {}
+        self.selected_rally_id = None
+
+        if project_json is not None:
+            self.current_project_dir = project_json.parent
+            self.current_project_json = project_json
+            self.current_video_path = video_path
+            self._load_project_state(project_json)
+        else:
+            self._load_or_create_project(video_path)
+
+        self.timeline.set_total_frames(self.processor.total_frames)
+        self.timeline.set_current_frame(0)
+        self.play_btn.setEnabled(True)
+        self.jump_back_btn.setEnabled(True)
+        self.prev_btn.setEnabled(True)
+        self.next_btn.setEnabled(True)
+        self.jump_forward_btn.setEnabled(True)
+        self.rally_start_btn.setEnabled(True)
+        self.rally_end_btn.setEnabled(True)
+        self.rally_split_btn.setEnabled(True)
+        self.export_btn.setEnabled(True)
+        self.action_panel.set_rallies(self.annotations.rallies)
+        self.timeline.set_actions(self.annotations.get_timeline_items())
+        self.detail_timeline.set_total_frames(self.processor.total_frames)
+        self._update_detail_timeline()
+        self.update_display()
+        self.status_bar.showMessage(
+            f"Loaded: {video_path} | {self.processor.total_frames} frames @ {self.processor.fps:.2f} fps"
+        )
+
+    def _load_or_create_project(self, video_path: Path):
+        """Create or load a project for the opened video."""
+        self.projects_dir.mkdir(parents=True, exist_ok=True)
+        project_name = video_path.stem
+        project_dir = self.projects_dir / project_name
+        project_dir.mkdir(parents=True, exist_ok=True)
+        project_json = project_dir / f"{project_name}.json"
+        ball_csv_path = video_path.with_name(f"{video_path.stem}_predict_ball.csv")
+
+        self.current_project_dir = project_dir
+        self.current_project_json = project_json
+        self.current_video_path = video_path
+        self.current_ball_csv_path = ball_csv_path if ball_csv_path.exists() else None
+        action4_json_path = video_path.with_name(f"{video_path.stem}_action4.json")
+        self.current_action4_json_path = action4_json_path if action4_json_path.exists() else None
+        self.current_ball_lookup = {}
+
+        if project_json.exists():
+            self._load_project_state(project_json)
+            logger.info(f"Loaded existing project: {project_json}")
+            return
+
+        self.current_ball_data = self._read_ball_csv(self.current_ball_csv_path) if self.current_ball_csv_path else []
+        self._rebuild_ball_lookup()
+        if self.current_action4_json_path:
+            self._load_initial_action4_json(self.current_action4_json_path)
+        self._save_project_state()
+        logger.info(f"Created project: {project_json}")
+
+    def _load_project_state(self, project_json: Path):
+        """Load project metadata and annotations from JSON."""
+        with open(project_json, "r", encoding="utf-8") as file_obj:
+            project_data = json.load(file_obj)
+
+        self.current_ball_data = self._normalize_ball_data(project_data.get("ball_data", []))
+        raw_ball_csv_path = project_data.get("ball_csv_path")
+        if raw_ball_csv_path:
+            candidate = Path(raw_ball_csv_path)
+            self.current_ball_csv_path = candidate if candidate.exists() else self.current_ball_csv_path
+        raw_action4_json_path = project_data.get("action4_json_path") or project_data.get("description", {}).get("action4_json_path")
+        if raw_action4_json_path:
+            candidate = Path(raw_action4_json_path)
+            self.current_action4_json_path = candidate if candidate.exists() else self.current_action4_json_path
+
+        annotations = project_data.get("annotations", {})
+        self.annotations.load_state(annotations)
+        self._rebuild_ball_lookup()
+
+    def _save_project_state(self):
+        """Persist current project state to JSON."""
+        if not self.current_project_json or not self.current_video_path:
+            return
+
+        if self.current_ball_csv_path and not self.current_ball_data and self.current_ball_csv_path.exists():
+            self.current_ball_data = self._read_ball_csv(self.current_ball_csv_path)
+            self._rebuild_ball_lookup()
+
+        payload = {
+            "name": self.current_video_path.stem,
+            "description": {
+                "project_path": str(self.current_project_json),
+                "video_path": str(self.current_video_path),
+                "ball_csv_path": str(self.current_ball_csv_path) if self.current_ball_csv_path else None,
+                "action4_json_path": str(self.current_action4_json_path) if self.current_action4_json_path else None,
+            },
+            "video_path": str(self.current_video_path),
+            "ball_csv_path": str(self.current_ball_csv_path) if self.current_ball_csv_path else None,
+            "action4_json_path": str(self.current_action4_json_path) if self.current_action4_json_path else None,
+            "ball_data": self._serialize_ball_data(),
+            "annotations": self.annotations.export_state(),
+            "updated_at": self._now_iso(),
+        }
+
+        if self.current_project_json.exists():
+            with open(self.current_project_json, "r", encoding="utf-8") as file_obj:
+                existing_data = json.load(file_obj)
+            payload["created_at"] = existing_data.get("created_at", payload["updated_at"])
+        else:
+            payload["created_at"] = payload["updated_at"]
+
+        with open(self.current_project_json, "w", encoding="utf-8") as file_obj:
+            json.dump(payload, file_obj, indent=2, ensure_ascii=False)
+
+    @staticmethod
+    def _read_ball_csv(csv_path: Path) -> list:
+        """Read ball CSV rows as initial project data."""
+        rows = []
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as file_obj:
+            reader = csv.DictReader(file_obj)
+            for row in reader:
+                try:
+                    rows.append([
+                        int(row.get("Frame", -1)),
+                        int(row.get("Visibility", 0)),
+                        int(float(row.get("X", -1))),
+                        int(float(row.get("Y", -1))),
+                    ])
+                except (TypeError, ValueError):
+                    continue
+        return rows
+
+    def _load_initial_action4_json(self, action4_json_path: Path):
+        """Load neighboring *_action4.json as initial YOLO annotation state."""
+        with open(action4_json_path, "r", encoding="utf-8") as file_obj:
+            action_data = json.load(file_obj)
+
+        raw_boxes = action_data.get("yolo_boxes", {})
+        if raw_boxes:
+            self.annotations.load_yolo_boxes(raw_boxes)
+
+    def _rebuild_ball_lookup(self):
+        """Reindex ball data rows by frame."""
+        lookup = {}
+        for row in self.current_ball_data:
+            if not isinstance(row, (list, tuple)) or len(row) < 4:
+                continue
+            try:
+                frame_idx = int(row[0])
+            except (TypeError, ValueError):
+                continue
+            lookup[frame_idx] = [int(row[0]), int(row[1]), int(row[2]), int(row[3])]
+        self.current_ball_lookup = lookup
+
+    def _get_current_ball_position_normalized(self):
+        """Get current frame ball position normalized to source frame."""
+        if not self.processor:
+            return None
+
+        row = self.current_ball_lookup.get(self.current_frame_idx)
+        if not row:
+            return None
+
+        try:
+            visibility = int(row[1])
+            x = float(row[2])
+            y = float(row[3])
+        except (TypeError, ValueError, IndexError):
+            return None
+
+        if visibility <= 0 or x < 0 or y < 0 or self.processor.width <= 0 or self.processor.height <= 0:
+            return None
+
+        return (
+            max(0.0, min(1.0, x / self.processor.width)),
+            max(0.0, min(1.0, y / self.processor.height)),
+        )
+
+    def _upsert_ball_point(self, frame_idx: int, x: int, y: int):
+        """Insert or update ball coordinates for a frame."""
+        payload = [int(frame_idx), 1, int(x), int(y)]
+        row = self.current_ball_lookup.get(frame_idx)
+        if row is None:
+            self.current_ball_data.append(payload)
+            self.current_ball_lookup[frame_idx] = payload
+        else:
+            row[0] = int(frame_idx)
+            row[1] = 1
+            row[2] = int(x)
+            row[3] = int(y)
+
+    def _update_detail_timeline(self):
+        """Show zoomed timeline for selected or current rally."""
+        rally = None
+        if self.selected_rally_id is not None:
+            rally = next((item for item in self.annotations.rallies if item.get("id") == self.selected_rally_id), None)
+
+        if rally is None:
+            rally = next(
+                (
+                    item for item in self.annotations.rallies
+                    if int(item.get("start_frame", -1)) <= self.current_frame_idx <= int(item.get("end_frame", -1))
+                ),
+                None,
+            )
+
+        self.detail_timeline.set_focus_rally(rally)
+        if self.processor:
+            self.detail_timeline.set_total_frames(self.processor.total_frames)
+        self.detail_timeline.set_current_frame(self.current_frame_idx)
+
+    def _serialize_ball_data(self) -> list:
+        """Return ball data in compact array format."""
+        normalized = self._normalize_ball_data(self.current_ball_data)
+        return sorted(normalized, key=lambda row: row[0])
+
+    @staticmethod
+    def _normalize_ball_data(ball_data) -> list:
+        """Normalize legacy and current ball data into [frame, visibility, x, y]."""
+        normalized = []
+        if not isinstance(ball_data, list):
+            return normalized
+
+        for row in ball_data:
+            if isinstance(row, dict):
+                try:
+                    normalized.append([
+                        int(row.get("Frame", -1)),
+                        int(row.get("Visibility", 0)),
+                        int(float(row.get("X", -1))),
+                        int(float(row.get("Y", -1))),
+                    ])
+                except (TypeError, ValueError):
+                    continue
+            elif isinstance(row, (list, tuple)) and len(row) >= 4:
+                try:
+                    normalized.append([
+                        int(row[0]),
+                        int(row[1]),
+                        int(row[2]),
+                        int(row[3]),
+                    ])
+                except (TypeError, ValueError):
+                    continue
+
+        return normalized
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.utcnow().isoformat() + "Z"
