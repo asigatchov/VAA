@@ -44,7 +44,8 @@ class ImageCanvas(QLabel):
         self.drag_box_original: Optional[Tuple] = None  # Original box before drag
         self.resize_mode: Optional[str] = None  # 'tl', 'tr', 'bl', 'br', 'move', None
         self.is_resizing = False
-        self.corner_grab_distance = 5  # Pixels from corner to activate resize
+        self.corner_grab_distance = 8  # Click target for resize handle
+        self.handle_radius = 3
         
         # Clipboard for copy/paste
         self.clipboard_boxes: List[Tuple] = []
@@ -169,6 +170,8 @@ class ImageCanvas(QLabel):
             pen = QPen(color, line_width)
             painter.setPen(pen)
             painter.drawRect(box_x, box_y, box_w, box_h)
+            if idx == self.selected_box_idx:
+                self._draw_resize_handles(painter, color, box_x, box_y, box_w, box_h)
             
             # Draw class label with ID above box
             class_name = self.box_classes.get(cls_id, f"Class {cls_id}")
@@ -178,6 +181,24 @@ class ImageCanvas(QLabel):
                 label_text = class_name
             painter.setFont(painter.font())
             painter.drawText(box_x, box_y - 5, label_text)
+
+    def _draw_resize_handles(
+        self,
+        painter: QPainter,
+        color: QColor,
+        box_x: int,
+        box_y: int,
+        box_w: int,
+        box_h: int,
+    ):
+        """Draw visible resize handles for easier corner grabbing."""
+        painter.save()
+        painter.setPen(QPen(color, 1))
+        painter.setBrush(color)
+        radius = self.handle_radius
+        painter.drawEllipse(QPoint(box_x, box_y), radius, radius)
+        painter.drawEllipse(QPoint(box_x + box_w, box_y + box_h), radius, radius)
+        painter.restore()
 
     def _draw_ball_marker(self, painter: QPainter, x_offset: int, y_offset: int, img_width: int, img_height: int):
         """Draw the current ball position."""
@@ -224,16 +245,14 @@ class ImageCanvas(QLabel):
             return
         
         if clicked_box_idx is not None:
-            # Check if clicking near a corner for resizing
             corner = self._find_box_corner_at_position(pos, clicked_box_idx)
             if corner:
-                # Start resizing
                 self.selected_box_idx = clicked_box_idx
                 self.is_resizing = True
                 self.resize_mode = corner
                 self.drag_start = pos
                 self.drag_box_original = self.boxes[clicked_box_idx]
-                logger.debug(f"Resizing box {clicked_box_idx}, corner: {corner}")
+                logger.debug(f"Resizing box {clicked_box_idx} via handle: {corner}")
             else:
                 # Select and move box
                 self.selected_box_idx = clicked_box_idx
@@ -270,6 +289,14 @@ class ImageCanvas(QLabel):
                 self._move_box(self.selected_box_idx, delta_pos)
                 self.drag_start = pos
                 self.update()
+        else:
+            hovered_box_idx = self._find_box_at_position(pos)
+            if hovered_box_idx is not None and self._find_box_corner_at_position(pos, hovered_box_idx):
+                self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+            elif hovered_box_idx is not None:
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
     
     def mouseReleaseEvent(self, event: QMouseEvent):
         """Handle mouse release to complete box creation."""
@@ -298,6 +325,7 @@ class ImageCanvas(QLabel):
         self.resize_mode = None
         self.drag_start = None
         self.drag_box_original = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
 
         if self.selected_box_idx is not None and 0 <= self.selected_box_idx < len(self.boxes):
             box = self.boxes[self.selected_box_idx]
@@ -576,13 +604,9 @@ class ImageCanvas(QLabel):
         mouse_y = pos.y()
         grab_dist = self.corner_grab_distance
         
-        # Check each corner
+        # Visible handles are top-left and bottom-right only.
         if abs(mouse_x - box_x1) <= grab_dist and abs(mouse_y - box_y1) <= grab_dist:
             return 'tl'  # Top-left
-        elif abs(mouse_x - box_x2) <= grab_dist and abs(mouse_y - box_y1) <= grab_dist:
-            return 'tr'  # Top-right
-        elif abs(mouse_x - box_x1) <= grab_dist and abs(mouse_y - box_y2) <= grab_dist:
-            return 'bl'  # Bottom-left
         elif abs(mouse_x - box_x2) <= grab_dist and abs(mouse_y - box_y2) <= grab_dist:
             return 'br'  # Bottom-right
         
@@ -626,22 +650,12 @@ class ImageCanvas(QLabel):
         new_w = orig_w
         new_h = orig_h
         
-        if self.resize_mode == 'tl':  # Top-left corner
+        if self.resize_mode == 'tl':  # Top-left handle
             new_w = orig_w - delta_x_norm
             new_h = orig_h - delta_y_norm
             new_x_c = orig_x_c + delta_x_norm / 2
             new_y_c = orig_y_c + delta_y_norm / 2
-        elif self.resize_mode == 'tr':  # Top-right corner
-            new_w = orig_w + delta_x_norm
-            new_h = orig_h - delta_y_norm
-            new_x_c = orig_x_c + delta_x_norm / 2
-            new_y_c = orig_y_c + delta_y_norm / 2
-        elif self.resize_mode == 'bl':  # Bottom-left corner
-            new_w = orig_w - delta_x_norm
-            new_h = orig_h + delta_y_norm
-            new_x_c = orig_x_c + delta_x_norm / 2
-            new_y_c = orig_y_c + delta_y_norm / 2
-        elif self.resize_mode == 'br':  # Bottom-right corner
+        elif self.resize_mode == 'br':  # Bottom-right handle
             new_w = orig_w + delta_x_norm
             new_h = orig_h + delta_y_norm
             new_x_c = orig_x_c + delta_x_norm / 2

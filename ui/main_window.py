@@ -54,6 +54,7 @@ class VideoAnnotationApp(QMainWindow):
         self.show_superframe = self.ui_config.show_superframe_on_start
         self.show_boxes = self.ui_config.show_boxes_on_start
         self.playback_speed = self.ui_config.default_playback_speed
+        self.playback_step = 1
         
         # Setup UI
         self.setWindowTitle(self.ui_config.window_title)
@@ -136,6 +137,16 @@ class VideoAnnotationApp(QMainWindow):
         self.rally_split_btn.clicked.connect(self.split_rally_at_current_frame)
         self.rally_split_btn.setEnabled(False)
         control_bar.addWidget(self.rally_split_btn)
+
+        self.prev_annotated_btn = QPushButton("#")
+        self.prev_annotated_btn.clicked.connect(self.prev_annotated_frame)
+        self.prev_annotated_btn.setEnabled(False)
+        control_bar.addWidget(self.prev_annotated_btn)
+
+        self.next_annotated_btn = QPushButton("@")
+        self.next_annotated_btn.clicked.connect(self.next_annotated_frame)
+        self.next_annotated_btn.setEnabled(False)
+        control_bar.addWidget(self.next_annotated_btn)
         
         # Add class selector for drawing
         control_bar.addWidget(QLabel("Draw Class:"))
@@ -178,6 +189,7 @@ class VideoAnnotationApp(QMainWindow):
         self.action_panel.rally_deleted.connect(self.delete_rally)
         self.action_panel.rally_selected.connect(self.on_rally_selected)
         self.action_panel.seek_to_rally.connect(self.seek)
+        self.action_panel.playback_step_changed.connect(self.on_playback_step_changed)
         
         right_panel = QVBoxLayout()
         right_panel.addWidget(self.action_panel)
@@ -302,6 +314,16 @@ class VideoAnnotationApp(QMainWindow):
         jump_forward_shortcut.triggered.connect(lambda: self.step_frames(15))
         self.addAction(jump_forward_shortcut)
 
+        prev_annotated_shortcut = QAction(self)
+        prev_annotated_shortcut.setShortcut("Q")
+        prev_annotated_shortcut.triggered.connect(self.prev_annotated_frame)
+        self.addAction(prev_annotated_shortcut)
+
+        next_annotated_shortcut = QAction(self)
+        next_annotated_shortcut.setShortcut("E")
+        next_annotated_shortcut.triggered.connect(self.next_annotated_frame)
+        self.addAction(next_annotated_shortcut)
+
         rally_start_shortcut = QAction(self)
         rally_start_shortcut.setShortcut("[")
         rally_start_shortcut.triggered.connect(self.start_rally)
@@ -382,7 +404,7 @@ class VideoAnnotationApp(QMainWindow):
     def next_frame(self):
         """Go to next frame."""
         if self.processor and self.current_frame_idx < self.processor.total_frames - 1:
-            self.step_frames(1)
+            self.step_frames(self.playback_step)
         elif self.is_playing:
             # Stop playback at end
             self.toggle_play()
@@ -402,6 +424,26 @@ class VideoAnnotationApp(QMainWindow):
         self.timeline.set_current_frame(self.current_frame_idx)
         self.detail_timeline.set_current_frame(self.current_frame_idx)
         self.update_display()
+
+    def prev_annotated_frame(self):
+        """Jump to previous frame that has box annotations."""
+        if not self.processor or not self.annotations.yolo_boxes:
+            return
+        candidates = sorted(frame for frame, boxes in self.annotations.yolo_boxes.items() if boxes and frame < self.current_frame_idx)
+        if candidates:
+            self.seek(candidates[-1])
+        else:
+            self.status_bar.showMessage("No previous annotated frame")
+
+    def next_annotated_frame(self):
+        """Jump to next frame that has box annotations."""
+        if not self.processor or not self.annotations.yolo_boxes:
+            return
+        candidates = sorted(frame for frame, boxes in self.annotations.yolo_boxes.items() if boxes and frame > self.current_frame_idx)
+        if candidates:
+            self.seek(candidates[0])
+        else:
+            self.status_bar.showMessage("No next annotated frame")
     
     def update_timer_interval(self):
         """Update timer interval based on playback speed."""
@@ -447,9 +489,23 @@ class VideoAnnotationApp(QMainWindow):
             self.class_combo.setCurrentIndex(combo_index)
         self.status_bar.showMessage(f"Selected rally step: {action_type}")
 
+    def on_playback_step_changed(self, step: int):
+        """Update frame increment used during playback."""
+        self.playback_step = max(1, min(30, int(step)))
+        self.status_bar.showMessage(f"Playback step set to {self.playback_step} frame(s)")
+
     def on_rally_selected(self, rally_id: int):
         """Track selected rally for detail timeline."""
         self.selected_rally_id = rally_id if rally_id >= 0 else None
+        self._update_detail_timeline()
+
+    def _refresh_annotation_views(self):
+        """Refresh rally list and both timelines from current annotation state."""
+        self.action_panel.set_rallies(self.annotations.rallies)
+        self.timeline.set_actions(self.annotations.get_timeline_items())
+        annotated_frames = self.annotations.get_annotated_timeline_frames()
+        self.timeline.set_annotated_frames(annotated_frames)
+        self.detail_timeline.set_annotated_frames(annotated_frames)
         self._update_detail_timeline()
 
     def update_display(self):
@@ -540,9 +596,7 @@ class VideoAnnotationApp(QMainWindow):
         rally = self.annotations.end_rally(self.current_frame_idx)
         
         if rally:
-            self.action_panel.set_rallies(self.annotations.rallies)
-            self.timeline.set_actions(self.annotations.get_timeline_items())
-            self._update_detail_timeline()
+            self._refresh_annotation_views()
             self._save_project_state()
             self.status_bar.showMessage(
                 f"Rally completed: {rally['start_frame']} - {rally['end_frame']}"
@@ -565,9 +619,7 @@ class VideoAnnotationApp(QMainWindow):
         
         if reply == QMessageBox.StandardButton.Yes:
             if self.annotations.delete_rally(rally_id):
-                self.action_panel.set_rallies(self.annotations.rallies)
-                self.timeline.set_actions(self.annotations.get_timeline_items())
-                self._update_detail_timeline()
+                self._refresh_annotation_views()
                 self._save_project_state()
                 self.status_bar.showMessage("Rally deleted")
 
@@ -577,9 +629,7 @@ class VideoAnnotationApp(QMainWindow):
             return
 
         if self.annotations.split_rally(self.current_frame_idx):
-            self.action_panel.set_rallies(self.annotations.rallies)
-            self.timeline.set_actions(self.annotations.get_timeline_items())
-            self._update_detail_timeline()
+            self._refresh_annotation_views()
             self._save_project_state()
             self.status_bar.showMessage(f"Rally split at frame {self.current_frame_idx}")
         else:
@@ -593,9 +643,7 @@ class VideoAnnotationApp(QMainWindow):
     def on_box_added(self, box):
         """Handle box added event from canvas."""
         box_id = self.annotations.add_yolo_box(self.current_frame_idx, box)
-        self.action_panel.set_rallies(self.annotations.rallies)
-        self.timeline.set_actions(self.annotations.get_timeline_items())
-        self._update_detail_timeline()
+        self._refresh_annotation_views()
         self._save_project_state()
         self.status_bar.showMessage(f"Box #{box_id} added to frame {self.current_frame_idx}")
         logger.debug(f"Box added: {box}, assigned id={box_id}")
@@ -617,9 +665,7 @@ class VideoAnnotationApp(QMainWindow):
             logger.debug(f"Box removed by index: {box_id_or_index}")
         else:
             logger.warning(f"Failed to remove box {box_id_or_index} from frame {self.current_frame_idx}")
-        self.action_panel.set_rallies(self.annotations.rallies)
-        self.timeline.set_actions(self.annotations.get_timeline_items())
-        self._update_detail_timeline()
+        self._refresh_annotation_views()
         self._save_project_state()
         self.update_display()
 
@@ -639,9 +685,7 @@ class VideoAnnotationApp(QMainWindow):
                 class_name = self.annot_config.box_classes.get(new_class_id, f"Class {new_class_id}")
                 self.status_bar.showMessage(f"Box #{box_id} class changed to {class_name}")
                 logger.info(f"Frame {self.current_frame_idx}, Box #{box_id} class changed to {class_name}")
-        self.action_panel.set_rallies(self.annotations.rallies)
-        self.timeline.set_actions(self.annotations.get_timeline_items())
-        self._update_detail_timeline()
+        self._refresh_annotation_views()
         self._save_project_state()
         self.update_display()
 
@@ -673,9 +717,7 @@ class VideoAnnotationApp(QMainWindow):
             height,
         )
         if updated:
-            self.action_panel.set_rallies(self.annotations.rallies)
-            self.timeline.set_actions(self.annotations.get_timeline_items())
-            self._update_detail_timeline()
+            self._refresh_annotation_views()
             self._save_project_state()
 
     def on_ball_point_set(self, x_norm: float, y_norm: float):
@@ -726,9 +768,7 @@ class VideoAnnotationApp(QMainWindow):
             pasted_ids.append(new_id)
         
         # Reload display to show pasted boxes
-        self.action_panel.set_rallies(self.annotations.rallies)
-        self.timeline.set_actions(self.annotations.get_timeline_items())
-        self._update_detail_timeline()
+        self._refresh_annotation_views()
         self._save_project_state()
         self.update_display()
         self.status_bar.showMessage(f"Pasted {len(clipboard_boxes)} boxes to frame {self.current_frame_idx} (IDs: {', '.join(map(str, pasted_ids))})")
@@ -896,11 +936,11 @@ class VideoAnnotationApp(QMainWindow):
         self.rally_start_btn.setEnabled(True)
         self.rally_end_btn.setEnabled(True)
         self.rally_split_btn.setEnabled(True)
+        self.prev_annotated_btn.setEnabled(True)
+        self.next_annotated_btn.setEnabled(True)
         self.export_btn.setEnabled(True)
-        self.action_panel.set_rallies(self.annotations.rallies)
-        self.timeline.set_actions(self.annotations.get_timeline_items())
+        self._refresh_annotation_views()
         self.detail_timeline.set_total_frames(self.processor.total_frames)
-        self._update_detail_timeline()
         self.update_display()
         self.status_bar.showMessage(
             f"Loaded: {video_path} | {self.processor.total_frames} frames @ {self.processor.fps:.2f} fps"

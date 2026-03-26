@@ -25,6 +25,7 @@ class TimelineWidget(QWidget):
         self.total_frames = 0
         self.current_frame = 0
         self.actions: List[Dict] = []
+        self.annotated_frames: List[Dict] = []
         self.action_colors = {}
         self.focus_rally: Optional[Dict] = None
         
@@ -47,6 +48,11 @@ class TimelineWidget(QWidget):
     def set_actions(self, actions: List[Dict]):
         """Set the list of actions to visualize."""
         self.actions = actions
+        self.update()
+
+    def set_annotated_frames(self, annotated_frames: List[Dict]):
+        """Set exact annotated frames to visualize."""
+        self.annotated_frames = annotated_frames
         self.update()
     
     def set_action_colors(self, colors: Dict[str, str]):
@@ -77,23 +83,21 @@ class TimelineWidget(QWidget):
         width = rect.width()
         height = rect.height()
         if self.total_frames > 0:
-            action_y = 10
-            action_height = 20
-            
             for action in self.actions:
+                if action.get("type") != "Rally":
+                    continue
                 start_frame = action.get("start_frame", 0)
                 end_frame = action.get("end_frame", 0)
-                action_type = action.get("type", "")
-                
-                # Calculate pixel positions
                 start_x = int((start_frame / self.total_frames) * width)
                 end_x = int((end_frame / self.total_frames) * width)
-                
-                # Draw action bar
-                color = self.action_colors.get(action_type, QColor("#888888"))
-                painter.fillRect(start_x, action_y, end_x - start_x, action_height, color)
+                painter.fillRect(start_x, 10, max(2, end_x - start_x), 20, QColor("#8f9b7a"))
+
+            for frame_item in self.annotated_frames:
+                frame_idx = int(frame_item.get("frame", 0))
+                frame_x = int((frame_idx / self.total_frames) * width)
+                color = self.action_colors.get(frame_item.get("type", ""), QColor("#d9d9d9"))
+                painter.fillRect(frame_x, 10, max(2, width // max(self.total_frames, 200)), 20, color)
         
-            # Draw timeline bar
             timeline_y = 40
             timeline_height = 10
             painter.fillRect(0, timeline_y, width, timeline_height, QColor("#555555"))
@@ -141,17 +145,20 @@ class TimelineWidget(QWidget):
             x = int(((frame - start_frame) / span) * width)
             painter.drawLine(x, 0, x, height)
 
-        painter.fillRect(0, 20, width, 24, QColor("#B9F27C"))
+        painter.fillRect(0, 20, width, 24, QColor("#8f9b7a"))
 
+        for frame_item in self.annotated_frames:
+            frame_idx = int(frame_item.get("frame", -1))
+            if frame_idx < start_frame or frame_idx > end_frame:
+                continue
+            frame_x = int(((frame_idx - start_frame) / span) * width)
+            color = self.action_colors.get(frame_item.get("type", ""), QColor("#d9d9d9"))
+            painter.fillRect(frame_x, 54, max(2, width // max(span, 60)), 18, color)
+
+        painter.setPen(QColor("#f5f5f5"))
         for action in self.focus_rally.get("actions", []):
             action_start = int(action.get("start_frame", start_frame))
-            action_end = int(action.get("end_frame", action_start))
             left = int(((action_start - start_frame) / span) * width)
-            right = int(((action_end - start_frame) / span) * width)
-            bar_width = max(2, right - left)
-            color = self.action_colors.get(action.get("type", ""), QColor("#60a5fa"))
-            painter.fillRect(left, 54, bar_width, 18, color)
-            painter.setPen(QColor("#f5f5f5"))
             painter.drawText(left + 2, 50, action.get("type", ""))
 
         pos_x = int(((self.current_frame - start_frame) / span) * width)

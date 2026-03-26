@@ -1,48 +1,41 @@
-"""Action panel widget for managing action annotations."""
-from typing import List, Dict, Optional
+"""Action panel widget for managing rally annotations."""
+from typing import List, Dict
+
+from PyQt6.QtCore import Qt, QSize, pyqtSignal
+from PyQt6.QtGui import QColor, QBrush, QFont
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QTableWidget, QTableWidgetItem, QLabel,
-    QHeaderView, QMenu, QFrame
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
+    QFrame, QMessageBox, QSpinBox, QTreeWidget, QTreeWidgetItem
 )
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QAction
 
 
 class ActionPanel(QWidget):
     """Panel for rally management and step selection."""
-    
-    # Signals
+
     start_rally_requested = pyqtSignal()
     end_rally_requested = pyqtSignal()
-    action_type_selected = pyqtSignal(str)  # Emits selected action type
-    rally_deleted = pyqtSignal(int)  # Emits rally ID
-    rally_selected = pyqtSignal(int)  # Emits rally ID
-    seek_to_rally = pyqtSignal(int)  # Emits frame index
-    
+    action_type_selected = pyqtSignal(str)
+    rally_deleted = pyqtSignal(int)
+    rally_selected = pyqtSignal(int)
+    seek_to_rally = pyqtSignal(int)
+    playback_step_changed = pyqtSignal(int)
+
     def __init__(self, action_types: List[str], parent=None):
         super().__init__(parent)
         self.action_types = action_types
         self.rallies: List[Dict] = []
-        self.table_rows: List[Dict] = []
         self.is_rally_pending = False
         self.selected_action_type = self.action_types[0] if self.action_types else ""
         self.action_buttons: Dict[str, QPushButton] = {}
-        
+
         self.setup_ui()
-    
+
     def setup_ui(self):
-        """Setup the UI components."""
         layout = QVBoxLayout(self)
-        
+
         selector_label = QLabel("Rally Flow")
         selector_label.setStyleSheet("font-weight: bold; font-size: 13px;")
         layout.addWidget(selector_label)
-
-        selector_hint = QLabel("Выберите шаг розыгрыша перед началом разметки.")
-        selector_hint.setWordWrap(True)
-        selector_hint.setStyleSheet("color: #9aa0a6; font-size: 11px;")
-        layout.addWidget(selector_hint)
 
         steps_frame = QFrame()
         steps_frame.setStyleSheet(
@@ -56,10 +49,9 @@ class ActionPanel(QWidget):
         for idx, action_type in enumerate(self.action_types):
             button = QPushButton(action_type)
             button.setCheckable(True)
-            button.clicked.connect(lambda checked, value=action_type: self._select_action_type(value))
-            button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.setMinimumHeight(28)
             button.setMinimumWidth(68)
+            button.clicked.connect(lambda checked, value=action_type: self._select_action_type(value))
             steps_layout.addWidget(button)
             self.action_buttons[action_type] = button
 
@@ -75,68 +67,111 @@ class ActionPanel(QWidget):
         self.selected_type_label.setStyleSheet("color: #cfd8dc; font-size: 11px;")
         layout.addWidget(self.selected_type_label)
         self._update_action_buttons()
-        
-        # Rally controls
+
+        playback_layout = QHBoxLayout()
+        playback_layout.setContentsMargins(0, 2, 0, 2)
+        playback_layout.setSpacing(8)
+        playback_label = QLabel("Step")
+        playback_label.setStyleSheet("font-weight: bold;")
+        playback_layout.addWidget(playback_label)
+
+        self.step_spin = QSpinBox()
+        self.step_spin.setRange(1, 30)
+        self.step_spin.setValue(1)
+        self.step_spin.setMinimumWidth(84)
+        self.step_spin.setMaximumWidth(96)
+        self.step_spin.valueChanged.connect(self.playback_step_changed.emit)
+        playback_layout.addWidget(self.step_spin)
+
+        playback_hint = QLabel("frames")
+        playback_hint.setStyleSheet("color: #8fa1b7; font-size: 11px;")
+        playback_layout.addWidget(playback_hint)
+
+        playback_layout.addStretch(1)
+        layout.addLayout(playback_layout)
+
         controls_layout = QHBoxLayout()
-        
+
         self.start_btn = QPushButton("▶ Start Rally")
         self.start_btn.setStyleSheet("background-color: #28a745; color: white; font-weight: bold; padding: 8px;")
         self.start_btn.clicked.connect(self._on_start_rally)
         controls_layout.addWidget(self.start_btn)
-        
+
         self.end_btn = QPushButton("⏹ End Rally")
         self.end_btn.setStyleSheet("background-color: #dc3545; color: white; font-weight: bold; padding: 8px;")
         self.end_btn.setEnabled(False)
         self.end_btn.clicked.connect(self._on_end_rally)
         controls_layout.addWidget(self.end_btn)
-        
+
         layout.addLayout(controls_layout)
-        
-        # Pending rally indicator
+
         self.pending_label = QLabel("")
         self.pending_label.setStyleSheet("color: #ffc107; font-style: italic;")
         self.pending_label.setVisible(False)
         layout.addWidget(self.pending_label)
-        
-        list_label = QLabel("Rallies:")
+
+        list_header = QHBoxLayout()
+        list_label = QLabel("Rallies")
         list_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
-        layout.addWidget(list_label)
-        
-        self.action_table = QTableWidget()
-        self.action_table.setColumnCount(5)
-        self.action_table.setHorizontalHeaderLabels(["Level", "Label", "Start", "End", "Frames"])
-        self.action_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.action_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.action_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.action_table.itemSelectionChanged.connect(self._on_selection_changed)
-        self.action_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.action_table.customContextMenuRequested.connect(self._show_context_menu)
-        layout.addWidget(self.action_table)
-        
-        # Statistics
+        list_header.addWidget(list_label)
+
+        self.delete_btn = QPushButton("Delete")
+        self.delete_btn.setEnabled(False)
+        self.delete_btn.clicked.connect(self._delete_selected_rally)
+        list_header.addWidget(self.delete_btn)
+        layout.addLayout(list_header)
+
+        self.rally_tree = QTreeWidget()
+        self.rally_tree.setHeaderHidden(True)
+        self.rally_tree.setIndentation(24)
+        self.rally_tree.setRootIsDecorated(True)
+        self.rally_tree.setUniformRowHeights(False)
+        self.rally_tree.setStyleSheet(
+            "QTreeWidget {"
+            "background-color: #15191f;"
+            "border: 1px solid #2e3642;"
+            "border-radius: 12px;"
+            "padding: 6px;"
+            "outline: none;"
+            "font-size: 13px;"
+            "}"
+            "QTreeWidget::item {"
+            "padding: 7px 8px;"
+            "margin: 2px 0;"
+            "border-radius: 8px;"
+            "}"
+            "QTreeWidget::item:selected {"
+            "background-color: #254a78;"
+            "color: white;"
+            "}"
+            "QTreeWidget::item:hover {"
+            "background-color: #1d2630;"
+            "}"
+        )
+        self.rally_tree.itemClicked.connect(self._on_item_clicked)
+        self.rally_tree.currentItemChanged.connect(self._on_current_item_changed)
+        layout.addWidget(self.rally_tree)
+
         self.stats_label = QLabel("Total Rallies: 0")
         self.stats_label.setStyleSheet("font-size: 10px; color: #888;")
         layout.addWidget(self.stats_label)
-    
+
     def _on_start_rally(self):
-        """Handle start rally button click."""
         self.is_rally_pending = True
         self.start_btn.setEnabled(False)
         self.end_btn.setEnabled(True)
-        self.pending_label.setText("⏺ Recording rally")
+        self.pending_label.setText("Recording rally")
         self.pending_label.setVisible(True)
         self.start_rally_requested.emit()
-    
+
     def _on_end_rally(self):
-        """Handle end rally button click."""
         self.is_rally_pending = False
         self.start_btn.setEnabled(True)
         self.end_btn.setEnabled(False)
         self.pending_label.setVisible(False)
         self.end_rally_requested.emit()
-    
+
     def cancel_pending_rally(self):
-        """Cancel the current pending rally."""
         if self.is_rally_pending:
             self.is_rally_pending = False
             self.start_btn.setEnabled(True)
@@ -144,13 +179,11 @@ class ActionPanel(QWidget):
             self.pending_label.setVisible(False)
 
     def _select_action_type(self, action_type: str):
-        """Select current action type from rally flow buttons."""
         self.selected_action_type = action_type
         self._update_action_buttons()
         self.action_type_selected.emit(action_type)
 
     def _update_action_buttons(self):
-        """Refresh button styles for the selected action type."""
         for action_type, button in self.action_buttons.items():
             is_selected = action_type == self.selected_action_type
             button.setChecked(is_selected)
@@ -172,102 +205,150 @@ class ActionPanel(QWidget):
 
         if self.selected_action_type:
             self.selected_type_label.setText(f"Текущее действие: {self.selected_action_type}")
-    
+
     def set_rallies(self, rallies: List[Dict]):
-        """Update the rally list."""
         self.rallies = rallies
-        self._refresh_table()
-    
-    def _refresh_table(self):
-        """Refresh the rally table display."""
-        self.table_rows = []
-        derived_actions = 0
+        self._refresh_list()
+
+    def _refresh_list(self):
+        current_rally_id = self._selected_rally_id()
+        self.rally_tree.clear()
+
+        annotated_rallies = 0
         for rally in self.rallies:
-            rally_actions = rally.get("actions", [])
-            derived_actions += len(rally_actions)
-            self.table_rows.append({
-                "kind": "rally",
-                "rally_id": rally["id"],
-                "label": f"Rally #{rally['id']}",
-                "start_time": rally.get("start_time", 0.0),
-                "end_time": rally.get("end_time", 0.0),
-                "start_frame": rally.get("start_frame", 0),
-                "end_frame": rally.get("end_frame", 0),
-            })
-            for child in rally.get("hierarchy", []):
-                self.table_rows.append(dict(child))
+            start_frame = int(rally.get("start_frame", 0))
+            end_frame = int(rally.get("end_frame", 0))
+            has_actions = bool(rally.get("actions"))
+            if has_actions:
+                annotated_rallies += 1
 
-        self.action_table.setRowCount(len(self.table_rows))
-        for row, item in enumerate(self.table_rows):
-            kind = item.get("kind", "")
-            if kind == "rally":
-                level = "rally"
-                label = item["label"]
-                start_value = f"{item.get('start_time', 0.0):.2f}"
-                end_value = f"{item.get('end_time', 0.0):.2f}"
-                frames_value = f"{item.get('start_frame', 0)}-{item.get('end_frame', 0)}"
-            elif kind == "marker":
-                level = "  marker"
-                label = item.get("label", "")
-                start_value = f"{item.get('time', 0.0):.2f}"
-                end_value = "-"
-                frames_value = str(item.get("frame", 0))
-            else:
-                level = "  action"
-                label = item.get("label", "")
-                start_value = f"{item.get('start_time', 0.0):.2f}"
-                end_value = f"{item.get('end_time', 0.0):.2f}"
-                frames_value = f"{item.get('start_frame', 0)}-{item.get('end_frame', 0)}"
+            item = QTreeWidgetItem([f"Rally #{rally['id']}   {start_frame}-{end_frame}"])
+            item.setData(0, Qt.ItemDataRole.UserRole, int(rally["id"]))
+            item.setData(0, Qt.ItemDataRole.UserRole + 1, int(rally["id"]))
+            item.setData(0, Qt.ItemDataRole.UserRole + 2, start_frame)
+            item.setToolTip(0, f"Frames {start_frame}-{end_frame}")
+            self._style_tree_item(item, "rally")
+            self.rally_tree.addTopLevelItem(item)
 
-            self.action_table.setItem(row, 0, QTableWidgetItem(level))
-            self.action_table.setItem(row, 1, QTableWidgetItem(label))
-            self.action_table.setItem(row, 2, QTableWidgetItem(start_value))
-            self.action_table.setItem(row, 3, QTableWidgetItem(end_value))
-            self.action_table.setItem(row, 4, QTableWidgetItem(frames_value))
-        
-        self.stats_label.setText(f"Total Rallies: {len(self.rallies)} | Derived Actions: {derived_actions}")
-    
-    def _on_selection_changed(self):
-        """Handle table row selection."""
-        selected_rows = self.action_table.selectedItems()
-        if selected_rows:
-            row = selected_rows[0].row()
-            if 0 <= row < len(self.table_rows):
-                rally_id = self.table_rows[row].get("rally_id", -1)
-                self.rally_selected.emit(rally_id)
-    
-    def _show_context_menu(self, pos):
-        """Show context menu for action table."""
-        item = self.action_table.itemAt(pos)
+            children = rally.get("hierarchy") or self._fallback_hierarchy(rally)
+            for child in children:
+                child_item = QTreeWidgetItem([self._format_hierarchy_label(child)])
+                child_item.setData(0, Qt.ItemDataRole.UserRole, int(rally["id"]))
+                child_item.setData(0, Qt.ItemDataRole.UserRole + 1, int(rally["id"]))
+                child_item.setData(0, Qt.ItemDataRole.UserRole + 2, self._target_frame(child))
+                child_item.setToolTip(0, self._format_hierarchy_tooltip(child))
+                self._style_tree_item(child_item, str(child.get("kind", "action")))
+                item.addChild(child_item)
+
+            item.setExpanded(True)
+            if current_rally_id == rally["id"]:
+                self.rally_tree.setCurrentItem(item)
+
+        self.delete_btn.setEnabled(self.rally_tree.currentItem() is not None)
+        self.stats_label.setText(f"Total Rallies: {len(self.rallies)} | Annotated: {annotated_rallies}")
+
+    def _selected_rally_id(self) -> int:
+        item = self.rally_tree.currentItem()
         if item is None:
+            return -1
+        return int(item.data(0, Qt.ItemDataRole.UserRole))
+
+    def _on_current_item_changed(self, current, previous):
+        del previous
+        rally_id = self._selected_rally_id()
+        self.delete_btn.setEnabled(rally_id >= 0)
+        self.rally_selected.emit(rally_id)
+
+    def _on_item_clicked(self, item: QTreeWidgetItem, column: int):
+        del column
+        rally_id = int(item.data(0, Qt.ItemDataRole.UserRole))
+        target_frame = item.data(0, Qt.ItemDataRole.UserRole + 2)
+        self.rally_selected.emit(rally_id)
+        if target_frame is not None:
+            self.seek_to_rally.emit(int(target_frame))
+
+    def _delete_selected_rally(self):
+        rally_id = self._selected_rally_id()
+        if rally_id < 0:
             return
-        
-        row = item.row()
-        if row < 0 or row >= len(self.table_rows):
+
+        reply = QMessageBox.question(
+            self,
+            "Delete Rally",
+            "Delete selected rally?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.rally_deleted.emit(rally_id)
+
+    @staticmethod
+    def _target_frame(item: Dict) -> int:
+        if "frame" in item:
+            return int(item["frame"])
+        return int(item.get("start_frame", 0))
+
+    @staticmethod
+    def _format_hierarchy_label(item: Dict) -> str:
+        item_type = str(item.get("type", ""))
+        if item.get("kind") == "marker":
+            frame = int(item.get("frame", 0))
+            label = "Start" if item_type == "RallyStart" else "End" if item_type == "RallyEnd" else item_type
+            return f"{label}   [{frame}]"
+
+        start_frame = int(item.get("start_frame", 0))
+        end_frame = int(item.get("end_frame", start_frame))
+        return f"{item_type}   {start_frame}-{end_frame}"
+
+    @staticmethod
+    def _format_hierarchy_tooltip(item: Dict) -> str:
+        if item.get("kind") == "marker":
+            return f"Frame {int(item.get('frame', 0))}"
+        return f"Frames {int(item.get('start_frame', 0))}-{int(item.get('end_frame', 0))}"
+
+    @staticmethod
+    def _fallback_hierarchy(rally: Dict) -> List[Dict]:
+        hierarchy = [
+            {
+                "kind": "marker",
+                "type": "RallyStart",
+                "frame": int(rally.get("start_frame", 0)),
+            }
+        ]
+        hierarchy.extend(rally.get("actions", []))
+        hierarchy.append(
+            {
+                "kind": "marker",
+                "type": "RallyEnd",
+                "frame": int(rally.get("end_frame", 0)),
+            }
+        )
+        return hierarchy
+
+    @staticmethod
+    def _style_tree_item(item: QTreeWidgetItem, item_kind: str):
+        if item_kind == "rally":
+            font = QFont()
+            font.setPointSize(12)
+            font.setBold(True)
+            item.setFont(0, font)
+            item.setForeground(0, QBrush(QColor("#f3f6fb")))
+            item.setBackground(0, QBrush(QColor("#202833")))
+            item.setSizeHint(0, QSize(0, 38))
             return
-        
-        item_data = self.table_rows[row]
-        rally_id = item_data.get("rally_id", -1)
-        rally = next((item for item in self.rallies if item.get("id") == rally_id), None)
-        if rally is None:
+
+        if item_kind == "marker":
+            font = QFont()
+            font.setPointSize(11)
+            font.setBold(True)
+            item.setFont(0, font)
+            item.setForeground(0, QBrush(QColor("#8fa1b7")))
+            item.setSizeHint(0, QSize(0, 28))
             return
-        
-        menu = QMenu(self)
-        
-        goto_start_action = QAction("Go to Start", self)
-        target_start = item_data.get("frame", item_data.get("start_frame", rally["start_frame"]))
-        goto_start_action.triggered.connect(lambda: self.seek_to_rally.emit(target_start))
-        menu.addAction(goto_start_action)
-        
-        goto_end_action = QAction("Go to End", self)
-        target_end = item_data.get("frame", item_data.get("end_frame", rally["end_frame"]))
-        goto_end_action.triggered.connect(lambda: self.seek_to_rally.emit(target_end))
-        menu.addAction(goto_end_action)
-        
-        menu.addSeparator()
-        
-        delete_rally = QAction("Delete Rally", self)
-        delete_rally.triggered.connect(lambda: self.rally_deleted.emit(rally["id"]))
-        menu.addAction(delete_rally)
-        
-        menu.exec(self.action_table.mapToGlobal(pos))
+
+        font = QFont()
+        font.setPointSize(11)
+        font.setBold(True)
+        item.setFont(0, font)
+        item.setForeground(0, QBrush(QColor("#8bd3ff")))
+        item.setBackground(0, QBrush(QColor("#18222c")))
+        item.setSizeHint(0, QSize(0, 32))

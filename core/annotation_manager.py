@@ -225,6 +225,43 @@ class AnnotationManager:
             key=lambda item: (item.get("start_frame", 0), 0 if item.get("type") == "Rally" else 1),
         )
 
+    def get_annotated_timeline_frames(self) -> List[Dict]:
+        """Return exact annotated frames with dominant action type for timeline rendering."""
+        ordered_action_types = ["Serve", "Receive", "Set", "Attack"]
+        action_priority = {name: index for index, name in enumerate(ordered_action_types)}
+        frames: List[Dict] = []
+
+        for frame_idx in sorted(self.yolo_boxes):
+            boxes = self.yolo_boxes.get(frame_idx, {})
+            if not boxes:
+                continue
+
+            class_names = []
+            for box_data in boxes.values():
+                class_id = int(box_data[0])
+                class_name = self.box_classes.get(class_id, f"Class {class_id}")
+                if class_name.lower() == "rally":
+                    continue
+                class_names.append(class_name)
+
+            if not class_names:
+                continue
+
+            dominant_type = sorted(
+                class_names,
+                key=lambda name: (action_priority.get(name, len(action_priority)), name),
+            )[0]
+
+            rally_id = None
+            for rally in self.rallies:
+                if int(rally.get("start_frame", -1)) <= frame_idx <= int(rally.get("end_frame", -1)):
+                    rally_id = int(rally.get("id", -1))
+                    break
+
+            frames.append({"frame": frame_idx, "type": dominant_type, "rally_id": rally_id})
+
+        return frames
+
     def get_statistics(self) -> Dict:
         """Get annotation statistics."""
         action_counts: Dict[str, int] = {}
