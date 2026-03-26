@@ -7,6 +7,10 @@ A desktop tool for annotating volleyball videos with:
 - normal frame and `3-frame` superframe viewing
 - manual ball position markup
 
+## Interface
+
+![VAA interface](docs/VAA-annotater-set.jpg)
+
 ## Features
 
 - Load a video and save/load project state.
