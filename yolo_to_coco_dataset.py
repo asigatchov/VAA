@@ -10,6 +10,7 @@ import shutil
 from pathlib import Path
 
 import cv2
+from tqdm import tqdm
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -47,13 +48,20 @@ def discover_samples(input_dir: Path) -> tuple[list[dict], dict[int, str]]:
     samples: list[dict] = []
     category_names: set[int] = set()
 
-    for dataset_dir in sorted(path for path in input_dir.iterdir() if path.is_dir()):
+    dataset_dirs = sorted(path for path in input_dir.iterdir() if path.is_dir())
+    for dataset_dir in tqdm(dataset_dirs, desc="Scanning datasets", unit="dataset"):
         images_dir = dataset_dir / "images"
         labels_dir = dataset_dir / "labels"
         if not images_dir.is_dir() or not labels_dir.is_dir():
             continue
 
-        for image_path in sorted(images_dir.iterdir()):
+        image_paths = sorted(images_dir.iterdir())
+        for image_path in tqdm(
+            image_paths,
+            desc=f"Reading {dataset_dir.name}",
+            unit="image",
+            leave=False,
+        ):
             if image_path.suffix.lower() not in IMAGE_EXTENSIONS or not image_path.is_file():
                 continue
 
@@ -139,7 +147,8 @@ def build_coco_split(split_name: str, samples: list[dict], output_dir: Path, cat
     }
 
     annotation_id = 1
-    for image_id, sample in enumerate(samples, start=1):
+    progress = tqdm(samples, desc=f"Building {split_name}", unit="image")
+    for image_id, sample in enumerate(progress, start=1):
         image_path = sample["image_path"]
         unique_name = f"{sample['dataset_name']}_{image_path.name}"
         target_image = split_dir / unique_name

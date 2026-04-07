@@ -218,6 +218,122 @@ class TestPasteWithNewIDs:
         assert len(set(all_ids)) == 6
 
 
+class TestRallyLifecycle:
+    """Test rally start/end/cancel behavior."""
+
+    def test_invalid_end_keeps_pending_rally(self):
+        manager = AnnotationManager()
+
+        assert manager.start_rally(100, fps=25.0) is True
+        assert manager.end_rally(99) is None
+        assert manager.current_rally_start is not None
+        assert manager.current_rally_start["frame"] == 100
+        assert manager.rallies == []
+
+    def test_cancel_pending_rally(self):
+        manager = AnnotationManager()
+
+        assert manager.start_rally(100, fps=25.0) is True
+        assert manager.cancel_rally() is True
+        assert manager.current_rally_start is None
+        assert manager.cancel_rally() is False
+
+    def test_clear_boxes_in_range(self):
+        manager = AnnotationManager()
+
+        manager.add_yolo_box(10, (0, 0.1, 0.1, 0.1, 0.1))
+        manager.add_yolo_box(11, (0, 0.2, 0.2, 0.1, 0.1))
+        manager.add_yolo_box(20, (0, 0.3, 0.3, 0.1, 0.1))
+
+        result = manager.clear_boxes_in_range(10, 11)
+
+        assert result == {"frames_cleared": 2, "boxes_removed": 2}
+        assert 10 not in manager.yolo_boxes
+        assert 11 not in manager.yolo_boxes
+        assert 20 in manager.yolo_boxes
+
+    def test_rebuild_actions_keeps_repeated_volleyball_sequences(self):
+        manager = AnnotationManager({
+            0: "Serve",
+            1: "Receive",
+            2: "Set",
+            3: "Attack",
+        })
+
+        assert manager.start_rally(100, fps=25.0) is True
+        manager.add_yolo_box(100, (0, 0.1, 0.1, 0.1, 0.1))
+        manager.add_yolo_box(110, (1, 0.1, 0.1, 0.1, 0.1))
+        manager.add_yolo_box(120, (2, 0.1, 0.1, 0.1, 0.1))
+        manager.add_yolo_box(130, (3, 0.1, 0.1, 0.1, 0.1))
+        manager.add_yolo_box(140, (1, 0.1, 0.1, 0.1, 0.1))
+        manager.add_yolo_box(150, (2, 0.1, 0.1, 0.1, 0.1))
+        manager.add_yolo_box(160, (3, 0.1, 0.1, 0.1, 0.1))
+        rally = manager.end_rally(170)
+
+        assert rally is not None
+        assert [action["type"] for action in manager.rallies[0]["actions"]] == [
+            "Serve", "Receive", "Set", "Attack", "Receive", "Set", "Attack"
+        ]
+        assert [action["start_frame"] for action in manager.rallies[0]["actions"]] == [
+            100, 110, 120, 130, 140, 150, 160
+        ]
+
+    def test_same_action_on_multiple_frames_stays_one_segment(self):
+        manager = AnnotationManager({
+            0: "Serve",
+            1: "Receive",
+            2: "Set",
+            3: "Attack",
+        })
+
+        assert manager.start_rally(100, fps=25.0) is True
+        manager.add_yolo_box(110, (1, 0.1, 0.1, 0.1, 0.1))
+        manager.add_yolo_box(115, (1, 0.1, 0.1, 0.1, 0.1))
+        manager.add_yolo_box(120, (2, 0.1, 0.1, 0.1, 0.1))
+        rally = manager.end_rally(130)
+
+        assert rally is not None
+        actions = manager.rallies[0]["actions"]
+        assert len(actions) == 2
+        assert actions[0]["id"] == 1
+        assert actions[0]["rally_id"] == 1
+        assert actions[0]["start_frame"] == 110
+        assert actions[0]["end_frame"] == 115
+        assert actions[0]["type"] == "Receive"
+        assert actions[0]["start_time"] == pytest.approx(110 / 25.0)
+        assert actions[0]["end_time"] == pytest.approx(115 / 25.0)
+        assert actions[1]["id"] == 2
+        assert actions[1]["rally_id"] == 1
+        assert actions[1]["start_frame"] == 120
+        assert actions[1]["end_frame"] == 120
+        assert actions[1]["type"] == "Set"
+        assert actions[1]["start_time"] == pytest.approx(120 / 25.0)
+        assert actions[1]["end_time"] == pytest.approx(120 / 25.0)
+
+    def test_update_action_segment_class_updates_consecutive_frames(self):
+        manager = AnnotationManager({
+            0: "Serve",
+            1: "Receive",
+            2: "Set",
+            3: "Attack",
+        })
+
+        assert manager.start_rally(100, fps=25.0) is True
+        manager.add_yolo_box(120, (2, 0.1, 0.1, 0.1, 0.1))
+        manager.add_yolo_box(121, (2, 0.1, 0.1, 0.1, 0.1))
+        manager.add_yolo_box(122, (2, 0.1, 0.1, 0.1, 0.1))
+        rally = manager.end_rally(130)
+
+        assert rally is not None
+        result = manager.update_action_segment_class(120, 122, "Set", 1)
+
+        assert result == {"boxes_updated": 3, "frames_updated": 3}
+        assert [manager.yolo_boxes[120][box_id][0] for box_id in manager.yolo_boxes[120]] == [1]
+        assert [action["type"] for action in manager.rallies[0]["actions"]] == ["Receive"]
+        assert manager.rallies[0]["actions"][0]["start_frame"] == 120
+        assert manager.rallies[0]["actions"][0]["end_frame"] == 122
+
+
 class TestYOLOExport:
     """Test YOLO format export."""
     

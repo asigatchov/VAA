@@ -185,7 +185,9 @@ class VideoAnnotationApp(QMainWindow):
         self.action_panel = ActionPanel(list(self.annot_config.action_types))
         self.action_panel.start_rally_requested.connect(self.start_rally)
         self.action_panel.end_rally_requested.connect(self.end_rally)
+        self.action_panel.cancel_rally_requested.connect(self.cancel_rally)
         self.action_panel.action_type_selected.connect(self.on_action_type_selected)
+        self.action_panel.action_reclass_requested.connect(self.on_action_reclass_requested)
         self.action_panel.rally_deleted.connect(self.delete_rally)
         self.action_panel.rally_selected.connect(self.on_rally_selected)
         self.action_panel.seek_to_rally.connect(self.seek)
@@ -268,6 +270,11 @@ class VideoAnnotationApp(QMainWindow):
         end_action_act.setShortcut("Shift+Return")
         end_action_act.triggered.connect(self.action_panel.end_btn.click)
         annot_menu.addAction(end_action_act)
+
+        cancel_action_act = QAction("&Cancel Pending Rally", self)
+        cancel_action_act.setShortcut("Escape")
+        cancel_action_act.triggered.connect(self.cancel_rally)
+        annot_menu.addAction(cancel_action_act)
         
         # Help menu
         help_menu = menubar.addMenu("&Help")
@@ -499,9 +506,74 @@ class VideoAnnotationApp(QMainWindow):
         self.selected_rally_id = rally_id if rally_id >= 0 else None
         self._update_detail_timeline()
 
+    def on_action_reclass_requested(
+        self,
+        rally_id: int,
+        start_frame: int,
+        end_frame: int,
+        old_action_type: str,
+        new_action_type: str,
+    ):
+        """Apply a class change to all boxes inside one derived action segment."""
+        del rally_id
+        if old_action_type == new_action_type:
+            self.status_bar.showMessage("Selected action already has that class")
+            return
+
+        new_class_id = next(
+            (
+                class_id for class_id, class_name in self.annot_config.box_classes.items()
+                if class_name == new_action_type
+            ),
+            None,
+        )
+        if new_class_id is None:
+            QMessageBox.warning(self, "Change Action Class", f"Class '{new_action_type}' is not configured.")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Change Action Class",
+            (
+                f"Change action {old_action_type} {start_frame}-{end_frame} to {new_action_type}?\n\n"
+                "All matching boxes on consecutive frames in this action segment will be updated."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        result = self.annotations.update_action_segment_class(
+            start_frame,
+            end_frame,
+            old_action_type,
+            new_class_id,
+        )
+        if result["boxes_updated"] <= 0:
+            QMessageBox.information(self, "Change Action Class", "No matching boxes were found in this action segment.")
+            return
+
+        self._refresh_annotation_views()
+        self._save_project_state()
+        self.update_display()
+        self.status_bar.showMessage(
+            f"Changed action {old_action_type} {start_frame}-{end_frame} to {new_action_type}: "
+            f"{result['boxes_updated']} boxes on {result['frames_updated']} frames"
+        )
+
+    def _pending_rally_preview(self):
+        """Return temporary rally preview for an in-progress rally."""
+        return self.annotations.get_pending_rally_preview(self.current_frame_idx)
+
     def _refresh_annotation_views(self):
         """Refresh rally list and both timelines from current annotation state."""
-        self.action_panel.set_rallies(self.annotations.rallies)
+        self.action_panel.set_rallies(self.annotations.rallies, self._pending_rally_preview())
+        pending_start = self.annotations.current_rally_start
+        pending_frame = None if pending_start is None else int(pending_start.get("frame", 0))
+        self.action_panel.set_pending_rally(pending_start is not None, pending_frame)
+        focused_rally = self._focused_rally()
+        focused_rally_id = None if focused_rally is None else int(focused_rally.get("id", -1))
+        self.action_panel.set_current_context(self.current_frame_idx, focused_rally_id)
         self.timeline.set_actions(self.annotations.get_timeline_items())
         annotated_frames = self.annotations.get_annotated_timeline_frames()
         self.timeline.set_annotated_frames(annotated_frames)
@@ -542,6 +614,11 @@ class VideoAnnotationApp(QMainWindow):
         
         # Update info labels
         self.update_info_labels()
+        if self.annotations.current_rally_start is not None:
+            self.action_panel.set_rallies(self.annotations.rallies, self._pending_rally_preview())
+        focused_rally = self._focused_rally()
+        focused_rally_id = None if focused_rally is None else int(focused_rally.get("id", -1))
+        self.action_panel.set_current_context(self.current_frame_idx, focused_rally_id)
         self._update_detail_timeline()
     
     def update_info_labels(self):
@@ -579,12 +656,21 @@ class VideoAnnotationApp(QMainWindow):
         )
         
         if success:
+            self._refresh_annotation_views()
             self._save_project_state()
             self.status_bar.showMessage(f"Rally started at frame {self.current_frame_idx}")
         else:
+            self._refresh_annotation_views()
+            start_frame = None
+            if self.annotations.current_rally_start is not None:
+                start_frame = int(self.annotations.current_rally_start["frame"])
             QMessageBox.warning(
                 self,
                 "Rally Already Started",
+                (
+                    f"A rally is already pending from frame {start_frame}. "
+                    "End it, or cancel it with Escape before starting a new one."
+                ) if start_frame is not None else
                 "Please end the current rally before starting a new one."
             )
     
@@ -594,7 +680,7 @@ class VideoAnnotationApp(QMainWindow):
             return
         
         rally = self.annotations.end_rally(self.current_frame_idx)
-        
+
         if rally:
             self._refresh_annotation_views()
             self._save_project_state()
@@ -602,26 +688,94 @@ class VideoAnnotationApp(QMainWindow):
                 f"Rally completed: {rally['start_frame']} - {rally['end_frame']}"
             )
         else:
-            QMessageBox.warning(
-                self,
-                "No Rally to End",
-                "Please start a rally first."
-            )
+            pending_start = self.annotations.current_rally_start
+            self._refresh_annotation_views()
+            if pending_start is not None:
+                start_frame = int(pending_start["frame"])
+                QMessageBox.warning(
+                    self,
+                    "Invalid Rally End",
+                    (
+                        f"Current frame {self.current_frame_idx} is before the pending rally start "
+                        f"at frame {start_frame}. Move forward, or cancel the pending rally with Escape."
+                    )
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "No Rally to End",
+                    "Please start a rally first."
+                )
+
+    def cancel_rally(self):
+        """Cancel the current pending rally."""
+        if self.annotations.cancel_rally():
+            self._refresh_annotation_views()
+            self._save_project_state()
+            self.status_bar.showMessage("Pending rally cancelled")
+            return
+
+        self._refresh_annotation_views()
+        QMessageBox.information(
+            self,
+            "No Pending Rally",
+            "There is no pending rally to cancel."
+        )
     
     def delete_rally(self, rally_id: int):
         """Delete a rally."""
-        reply = QMessageBox.question(
-            self,
-            "Delete Rally",
-            "Are you sure you want to delete this rally?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        rally = next((item for item in self.annotations.rallies if int(item.get("id", -1)) == int(rally_id)), None)
+        if rally is None:
+            QMessageBox.warning(
+                self,
+                "Delete Rally",
+                "Selected rally was not found."
+            )
+            return
+
+        action_count = len(rally.get("actions", []))
+        start_frame = int(rally.get("start_frame", 0))
+        end_frame = int(rally.get("end_frame", 0))
+        action_label = "action" if action_count == 1 else "actions"
+        box_summary = self._count_boxes_in_range(start_frame, end_frame)
+        ball_count = self._count_ball_points_in_range(start_frame, end_frame)
+
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Delete Rally")
+        dialog.setText(f"Choose how to delete rally {start_frame}-{end_frame}.")
+        dialog.setInformativeText(
+            f"Rally contains {action_count} derived {action_label}.\n"
+            f"Range markup: {box_summary['boxes']} boxes on {box_summary['frames']} frames"
+            f" and {ball_count} ball points."
         )
-        
-        if reply == QMessageBox.StandardButton.Yes:
+        only_rally_button = dialog.addButton("Only Rally", QMessageBox.ButtonRole.AcceptRole)
+        with_markup_button = dialog.addButton("Rally + Markup", QMessageBox.ButtonRole.DestructiveRole)
+        dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(only_rally_button)
+        dialog.exec()
+
+        clicked = dialog.clickedButton()
+        if clicked == only_rally_button:
             if self.annotations.delete_rally(rally_id):
                 self._refresh_annotation_views()
                 self._save_project_state()
-                self.status_bar.showMessage("Rally deleted")
+                self.status_bar.showMessage(
+                    f"Deleted rally {start_frame}-{end_frame}; frame markup kept"
+                )
+            return
+
+        if clicked == with_markup_button:
+            if self.annotations.delete_rally(rally_id):
+                removed_boxes = self.annotations.clear_boxes_in_range(start_frame, end_frame)
+                removed_ball_points = self._clear_ball_points_in_range(start_frame, end_frame)
+                self._refresh_annotation_views()
+                self._save_project_state()
+                self.update_display()
+                self.status_bar.showMessage(
+                    f"Deleted rally {start_frame}-{end_frame} and markup: "
+                    f"{removed_boxes['boxes_removed']} boxes, {removed_ball_points} ball points"
+                )
 
     def split_rally_at_current_frame(self):
         """Split the rally containing the current frame into two rallies."""
@@ -671,20 +825,28 @@ class VideoAnnotationApp(QMainWindow):
 
 
 
-    def on_box_class_changed(self, box_index: int, new_class_id: int):
+    def on_box_class_changed(self, box_id_or_index: int, new_class_id: int):
         """Handle box class change event from canvas."""
-        # Update the box in annotations
-        if self.current_frame_idx in self.annotations.yolo_boxes:
+        updated_box_id = None
+        updated = self.annotations.update_box_class(self.current_frame_idx, box_id_or_index, new_class_id)
+
+        if updated:
+            updated_box_id = box_id_or_index
+        elif self.current_frame_idx in self.annotations.yolo_boxes:
             boxes_dict = self.annotations.yolo_boxes[self.current_frame_idx]
-            # Find box by index in the displayed list
             box_ids = list(boxes_dict.keys())
-            if 0 <= box_index < len(box_ids):
-                box_id = box_ids[box_index]
-                self.annotations.update_box_class(self.current_frame_idx, box_id, new_class_id)
-                
-                class_name = self.annot_config.box_classes.get(new_class_id, f"Class {new_class_id}")
-                self.status_bar.showMessage(f"Box #{box_id} class changed to {class_name}")
-                logger.info(f"Frame {self.current_frame_idx}, Box #{box_id} class changed to {class_name}")
+            if 0 <= box_id_or_index < len(box_ids):
+                updated_box_id = box_ids[box_id_or_index]
+                updated = self.annotations.update_box_class(self.current_frame_idx, updated_box_id, new_class_id)
+
+        if updated and updated_box_id is not None:
+            class_name = self.annot_config.box_classes.get(new_class_id, f"Class {new_class_id}")
+            self.status_bar.showMessage(f"Box #{updated_box_id} class changed to {class_name}")
+            logger.info(f"Frame {self.current_frame_idx}, Box #{updated_box_id} class changed to {class_name}")
+        else:
+            logger.warning(
+                f"Failed to change box class for {box_id_or_index} on frame {self.current_frame_idx}"
+            )
         self._refresh_annotation_views()
         self._save_project_state()
         self.update_display()
@@ -1106,11 +1268,49 @@ class VideoAnnotationApp(QMainWindow):
             row[2] = int(x)
             row[3] = int(y)
 
-    def _update_detail_timeline(self):
-        """Show zoomed timeline for selected or current rally."""
+    def _count_boxes_in_range(self, start_frame: int, end_frame: int) -> dict:
+        """Return box totals for an inclusive frame range."""
+        frames = 0
+        boxes = 0
+        for frame_idx, frame_boxes in self.annotations.yolo_boxes.items():
+            if start_frame <= int(frame_idx) <= end_frame and frame_boxes:
+                frames += 1
+                boxes += len(frame_boxes)
+        return {"frames": frames, "boxes": boxes}
+
+    def _count_ball_points_in_range(self, start_frame: int, end_frame: int) -> int:
+        """Return number of ball points inside an inclusive frame range."""
+        return sum(
+            1 for frame_idx in self.current_ball_lookup
+            if start_frame <= int(frame_idx) <= end_frame
+        )
+
+    def _clear_ball_points_in_range(self, start_frame: int, end_frame: int) -> int:
+        """Remove ball points inside an inclusive frame range."""
+        remaining_ball_data = []
+        removed = 0
+
+        for row in self.current_ball_data:
+            frame_idx = int(row[0])
+            if start_frame <= frame_idx <= end_frame:
+                removed += 1
+                continue
+            remaining_ball_data.append(row)
+
+        if removed:
+            self.current_ball_data = remaining_ball_data
+            self._rebuild_ball_lookup()
+
+        return removed
+
+    def _focused_rally(self):
+        """Return rally currently focused in the UI."""
         rally = None
         if self.selected_rally_id is not None:
-            rally = next((item for item in self.annotations.rallies if item.get("id") == self.selected_rally_id), None)
+            if self.selected_rally_id == 0:
+                rally = self._pending_rally_preview()
+            else:
+                rally = next((item for item in self.annotations.rallies if item.get("id") == self.selected_rally_id), None)
 
         if rally is None:
             rally = next(
@@ -1121,6 +1321,14 @@ class VideoAnnotationApp(QMainWindow):
                 None,
             )
 
+        if rally is None:
+            rally = self._pending_rally_preview()
+
+        return rally
+
+    def _update_detail_timeline(self):
+        """Show zoomed timeline for selected or current rally."""
+        rally = self._focused_rally()
         self.detail_timeline.set_focus_rally(rally)
         if self.processor:
             self.detail_timeline.set_total_frames(self.processor.total_frames)

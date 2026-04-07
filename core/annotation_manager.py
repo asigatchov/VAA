@@ -184,6 +184,30 @@ class AnnotationManager:
             self._rebuild_actions()
             logger.debug(f"All boxes cleared from frame {frame_idx}")
 
+    def clear_boxes_in_range(self, start_frame: int, end_frame: int) -> Dict[str, int]:
+        """Clear all boxes within an inclusive frame range."""
+        frames_to_clear = [
+            frame_idx for frame_idx in self.yolo_boxes
+            if start_frame <= int(frame_idx) <= end_frame
+        ]
+        boxes_removed = 0
+
+        for frame_idx in frames_to_clear:
+            boxes_removed += len(self.yolo_boxes.get(frame_idx, {}))
+            del self.yolo_boxes[frame_idx]
+
+        if frames_to_clear:
+            self._rebuild_actions()
+            logger.info(
+                f"Cleared {boxes_removed} boxes across {len(frames_to_clear)} frames "
+                f"for range {start_frame}-{end_frame}"
+            )
+
+        return {
+            "frames_cleared": len(frames_to_clear),
+            "boxes_removed": boxes_removed,
+        }
+
     def export_yolo(self, output_dir: str) -> int:
         """Export YOLO format annotations."""
         labels_dir = os.path.join(output_dir, "labels")
@@ -225,32 +249,38 @@ class AnnotationManager:
             key=lambda item: (item.get("start_frame", 0), 0 if item.get("type") == "Rally" else 1),
         )
 
+    def get_pending_rally_preview(self, current_frame_idx: int) -> Optional[Dict]:
+        """Build a temporary rally view for an in-progress rally."""
+        if self.current_rally_start is None:
+            return None
+
+        start_frame = int(self.current_rally_start["frame"])
+        end_frame = max(start_frame, int(current_frame_idx))
+        fps = float(self.current_rally_start.get("fps", 30.0))
+        preview = {
+            "id": 0,
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "type": "Rally",
+            "start_time": start_frame / fps,
+            "end_time": end_frame / fps,
+            "created_at": self.current_rally_start.get("created_at"),
+            "actions": self._derive_actions_for_range(start_frame, end_frame, fps),
+            "hierarchy": [],
+            "is_pending": True,
+        }
+
+        preview["hierarchy"] = self._build_pending_rally_hierarchy(preview, preview["actions"])
+        return preview
+
     def get_annotated_timeline_frames(self) -> List[Dict]:
         """Return exact annotated frames with dominant action type for timeline rendering."""
-        ordered_action_types = ["Serve", "Receive", "Set", "Attack"]
-        action_priority = {name: index for index, name in enumerate(ordered_action_types)}
         frames: List[Dict] = []
 
         for frame_idx in sorted(self.yolo_boxes):
-            boxes = self.yolo_boxes.get(frame_idx, {})
-            if not boxes:
+            dominant_type = self._dominant_action_for_frame(frame_idx)
+            if dominant_type is None:
                 continue
-
-            class_names = []
-            for box_data in boxes.values():
-                class_id = int(box_data[0])
-                class_name = self.box_classes.get(class_id, f"Class {class_id}")
-                if class_name.lower() == "rally":
-                    continue
-                class_names.append(class_name)
-
-            if not class_names:
-                continue
-
-            dominant_type = sorted(
-                class_names,
-                key=lambda name: (action_priority.get(name, len(action_priority)), name),
-            )[0]
 
             rally_id = None
             for rally in self.rallies:
@@ -369,6 +399,56 @@ class AnnotationManager:
         self._rebuild_actions()
         return True
 
+    def update_action_segment_class(
+        self,
+        start_frame: int,
+        end_frame: int,
+        old_action_type: str,
+        new_class_id: int,
+    ) -> Dict[str, int]:
+        """Change class for all boxes matching one derived action segment."""
+        boxes_updated = 0
+        frames_updated = 0
+
+        for frame_idx in sorted(self.yolo_boxes):
+            if frame_idx < start_frame or frame_idx > end_frame:
+                continue
+
+            frame_box_ids = []
+            for box_id, box_data in self.yolo_boxes[frame_idx].items():
+                class_id = int(box_data[0])
+                class_name = self.box_classes.get(class_id, f"Class {class_id}")
+                if class_name == old_action_type:
+                    frame_box_ids.append(box_id)
+
+            if not frame_box_ids:
+                continue
+
+            for box_id in frame_box_ids:
+                box_data = self.yolo_boxes[frame_idx][box_id]
+                self.yolo_boxes[frame_idx][box_id] = (
+                    new_class_id,
+                    box_data[1],
+                    box_data[2],
+                    box_data[3],
+                    box_data[4],
+                )
+                boxes_updated += 1
+
+            frames_updated += 1
+
+        if boxes_updated:
+            self._rebuild_actions()
+            logger.info(
+                f"Updated action segment {old_action_type} {start_frame}-{end_frame} "
+                f"to class {new_class_id}: {boxes_updated} boxes across {frames_updated} frames"
+            )
+
+        return {
+            "boxes_updated": boxes_updated,
+            "frames_updated": frames_updated,
+        }
+
     def _get_unique_box_id(self, frame_idx: int) -> int:
         """Generate a unique box ID."""
         while True:
@@ -397,48 +477,73 @@ class AnnotationManager:
         self.next_action_id = next_action_id
 
     def _derive_actions_for_range(self, start_frame: int, end_frame: int, fps: float) -> List[Dict]:
-        """Build action ranges from boxes between start and end frames."""
-        class_frames: Dict[str, Dict[str, int]] = {}
-
+        """Build sequential action segments from annotated frames inside a rally."""
+        frame_actions: List[tuple[int, str]] = []
         for frame_idx in sorted(self.yolo_boxes):
             if frame_idx < start_frame or frame_idx > end_frame:
                 continue
 
-            for _, box_data in self.yolo_boxes[frame_idx].items():
-                class_id = int(box_data[0])
-                class_name = self.box_classes.get(class_id, f"Class {class_id}")
-                if class_name.lower() == "rally":
-                    continue
+            action_type = self._dominant_action_for_frame(frame_idx)
+            if action_type is None:
+                continue
+            frame_actions.append((int(frame_idx), action_type))
 
-                if class_name not in class_frames:
-                    class_frames[class_name] = {"start_frame": frame_idx, "end_frame": frame_idx}
-                else:
-                    class_frames[class_name]["start_frame"] = min(class_frames[class_name]["start_frame"], frame_idx)
-                    class_frames[class_name]["end_frame"] = max(class_frames[class_name]["end_frame"], frame_idx)
-
-        ordered_action_types = ["Serve", "Receive", "Set", "Attack"]
-        ordered_names = sorted(
-            class_frames,
-            key=lambda name: (
-                ordered_action_types.index(name) if name in ordered_action_types else len(ordered_action_types),
-                class_frames[name]["start_frame"],
-            ),
-        )
+        if not frame_actions:
+            return []
 
         actions: List[Dict] = []
-        for action_type in ordered_names:
-            action_range = class_frames[action_type]
-            actions.append(
-                {
-                    "start_frame": action_range["start_frame"],
-                    "end_frame": action_range["end_frame"],
-                    "type": action_type,
-                    "start_time": action_range["start_frame"] / fps,
-                    "end_time": action_range["end_frame"] / fps,
-                }
-            )
+        segment_start, current_type = frame_actions[0]
+        segment_end = segment_start
 
+        for frame_idx, action_type in frame_actions[1:]:
+            if action_type == current_type:
+                segment_end = frame_idx
+                continue
+
+            actions.append(
+                self._build_action_segment(segment_start, segment_end, current_type, fps)
+            )
+            segment_start = frame_idx
+            segment_end = frame_idx
+            current_type = action_type
+
+        actions.append(self._build_action_segment(segment_start, segment_end, current_type, fps))
         return actions
+
+    def _build_action_segment(self, start_frame: int, end_frame: int, action_type: str, fps: float) -> Dict:
+        """Build one derived action segment."""
+        return {
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "type": action_type,
+            "start_time": start_frame / fps,
+            "end_time": end_frame / fps,
+        }
+
+    def _dominant_action_for_frame(self, frame_idx: int) -> Optional[str]:
+        """Return dominant action type for one frame based on labeled boxes."""
+        boxes = self.yolo_boxes.get(frame_idx, {})
+        if not boxes:
+            return None
+
+        ordered_action_types = ["Serve", "Receive", "Set", "Attack"]
+        action_priority = {name: index for index, name in enumerate(ordered_action_types)}
+        class_names: List[str] = []
+
+        for box_data in boxes.values():
+            class_id = int(box_data[0])
+            class_name = self.box_classes.get(class_id, f"Class {class_id}")
+            if class_name.lower() == "rally":
+                continue
+            class_names.append(class_name)
+
+        if not class_names:
+            return None
+
+        return sorted(
+            class_names,
+            key=lambda name: (action_priority.get(name, len(action_priority)), name),
+        )[0]
 
     def _build_rally_hierarchy(self, rally: Dict, rally_actions: List[Dict]) -> List[Dict]:
         """Build persisted hierarchical representation for one rally."""
@@ -473,6 +578,45 @@ class AnnotationManager:
                 "kind": "marker",
                 "label": "rally_end",
                 "type": "RallyEnd",
+                "frame": rally["end_frame"],
+                "time": rally["end_time"],
+                "rally_id": rally["id"],
+            }
+        )
+        return hierarchy
+
+    def _build_pending_rally_hierarchy(self, rally: Dict, rally_actions: List[Dict]) -> List[Dict]:
+        """Build temporary hierarchy for an in-progress rally."""
+        hierarchy = [
+            {
+                "kind": "marker",
+                "label": "rally_start",
+                "type": "RallyStart",
+                "frame": rally["start_frame"],
+                "time": rally["start_time"],
+                "rally_id": rally["id"],
+            }
+        ]
+
+        for action in rally_actions:
+            hierarchy.append(
+                {
+                    "kind": "action",
+                    "label": action["type"].lower(),
+                    "type": action["type"],
+                    "start_frame": action["start_frame"],
+                    "end_frame": action["end_frame"],
+                    "start_time": action["start_time"],
+                    "end_time": action["end_time"],
+                    "rally_id": rally["id"],
+                }
+            )
+
+        hierarchy.append(
+            {
+                "kind": "marker",
+                "label": "current_frame",
+                "type": "CurrentFrame",
                 "frame": rally["end_frame"],
                 "time": rally["end_time"],
                 "rally_id": rally["id"],

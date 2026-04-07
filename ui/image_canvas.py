@@ -13,7 +13,7 @@ class ImageCanvas(QLabel):
     box_added = pyqtSignal(tuple)  # Emits (class_id, x_center, y_center, width, height)
     box_removed = pyqtSignal(int)  # Emits box index
     box_selected = pyqtSignal(int)  # Emits box index
-    box_class_changed = pyqtSignal(int, int)  # Emits (box_index, new_class_id)
+    box_class_changed = pyqtSignal(int, int)  # Emits (box_id_or_index, new_class_id)
     box_geometry_changed = pyqtSignal(int, float, float, float, float, int)  # box_index, x, y, w, h, box_id
     ball_point_set = pyqtSignal(float, float)  # Emits normalized x, y
     
@@ -542,7 +542,7 @@ class ImageCanvas(QLabel):
                 self.boxes[box_idx] = (new_class_id, x_c, y_c, w, h, box_id)
             else:
                 self.boxes[box_idx] = (new_class_id, x_c, y_c, w, h)
-            self.box_class_changed.emit(box_idx, new_class_id)
+            self.box_class_changed.emit(box_id if box_id is not None else box_idx, new_class_id)
             self.update()
             self.last_used_class_id = new_class_id       
             logger.info(f"Box {box_idx} class changed from '{old_class}' to '{new_class}'")
