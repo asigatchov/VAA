@@ -31,6 +31,8 @@ class AnnotationConfig:
         1: "Receive",
         2: "Set",
         3: "Attack",
+        5: "player",
+        6: "ball",
     })
 
 
@@ -56,6 +58,8 @@ class UIConfig:
         1: "#4ECDC4",    # Receive
         2: "#45B7D1",    # Set
         3: "#FFA07A",    # Attack
+        5: "#6C5CE7",    # player
+        6: "#FFD60A",    # ball
     })
     selected_box_color: str = "#00FF00"
     box_line_width: int = 2

@@ -14,6 +14,31 @@ from tqdm import tqdm
 BALL_DIAMETER_PX = 20
 BALL_RADIUS_PX = BALL_DIAMETER_PX // 2
 
+EXPORT_CLASS_NAMES = {
+    0: "serve",
+    1: "receive",
+    2: "set",
+    3: "attack",
+    4: "player",
+    5: "ball",
+}
+
+ACTION_EXPORT_CLASS_IDS = {0, 1, 2, 3}
+
+CLASS_NAME_ALIASES = {
+    "serve": "serve",
+    "server": "serve",
+    "receive": "receive",
+    "recive": "receive",
+    "reception": "receive",
+    "set": "set",
+    "attack": "attack",
+    "attak": "attack",
+    "player": "player",
+    "playery": "player",
+    "ball": "ball",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -23,8 +48,9 @@ def parse_args() -> argparse.Namespace:
             "frame-1, frame, frame+1, while labels come from the current frame only."
         )
     )
-    parser.add_argument("--project_path", required=True, help="Path to VAA project JSON")
-    parser.add_argument("--data_dir", required=True, help="Output dataset directory")
+    parser.add_argument("project_path", nargs="?", help="Path to VAA project JSON")
+    parser.add_argument("--project_path", dest="project_path_flag", help="Path to VAA project JSON")
+    parser.add_argument("--data_dir", default="datasets-yolo", help="Output dataset directory")
     parser.add_argument(
         "--no-progress",
         action="store_true",
@@ -38,7 +64,11 @@ def parse_args() -> argparse.Namespace:
             "grayscale superframe using a 20px diameter marker."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.project_path = args.project_path_flag or args.project_path
+    if not args.project_path:
+        parser.error("project_path is required")
+    return args
 
 
 def read_project(project_path: Path) -> dict:
@@ -194,6 +224,98 @@ def write_yolo_label(label_path: Path, frame_boxes: dict) -> None:
             )
 
 
+def write_dataset_yaml(output_root: Path) -> None:
+    yaml_lines = [
+        f"path: {output_root}",
+        "train: images",
+        "val: images",
+        f"nc: {len(EXPORT_CLASS_NAMES)}",
+        "names:",
+    ]
+    for class_id, class_name in sorted(EXPORT_CLASS_NAMES.items()):
+        yaml_lines.append(f"  {class_id}: {class_name}")
+
+    with open(output_root / "data.yaml", "w", encoding="utf-8") as file_obj:
+        file_obj.write("\n".join(yaml_lines) + "\n")
+
+
+def normalize_class_name(class_name: str | None) -> str | None:
+    if class_name is None:
+        return None
+    return CLASS_NAME_ALIASES.get(class_name.strip().lower())
+
+
+def resolve_box_name(box_classes: dict[int, str], class_id: int) -> str | None:
+    class_name = box_classes.get(class_id)
+    normalized = normalize_class_name(class_name)
+    if normalized is not None:
+        return normalized
+    return CLASS_NAME_ALIASES.get(str(class_id).strip().lower())
+
+
+def clamp_normalized(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def ball_position_to_box(x: int, y: int, frame_width: int, frame_height: int) -> list[float]:
+    x_center = clamp_normalized(x / frame_width)
+    y_center = clamp_normalized(y / frame_height)
+    width = clamp_normalized(BALL_DIAMETER_PX / frame_width)
+    height = clamp_normalized(BALL_DIAMETER_PX / frame_height)
+    return [5, x_center, y_center, width, height]
+
+
+def remap_frame_boxes(
+    frame_boxes: dict,
+    box_classes: dict[int, str],
+    frame_width: int,
+    frame_height: int,
+    ball_position: tuple[int, int] | None,
+) -> dict[str, list[float]]:
+    candidate_boxes: list[list[float]] = []
+    next_box_id = 1
+
+    for _, box_data in sorted(frame_boxes.items(), key=lambda item: int(item[0])):
+        if len(box_data) < 5:
+            continue
+
+        original_class_id = int(box_data[0])
+        normalized_name = resolve_box_name(box_classes, original_class_id)
+        if normalized_name is None:
+            continue
+
+        export_class_id = next(
+            (class_id for class_id, class_name in EXPORT_CLASS_NAMES.items() if class_name == normalized_name),
+            None,
+        )
+        if export_class_id is None:
+            continue
+
+        _, x_center, y_center, width, height = box_data[:5]
+        candidate_boxes.append([
+            export_class_id,
+            clamp_normalized(float(x_center)),
+            clamp_normalized(float(y_center)),
+            clamp_normalized(float(width)),
+            clamp_normalized(float(height)),
+        ])
+
+    has_action_box = any(int(box_data[0]) in ACTION_EXPORT_CLASS_IDS for box_data in candidate_boxes)
+    export_boxes: dict[str, list[float]] = {}
+
+    if has_action_box:
+        for box_data in candidate_boxes:
+            export_boxes[str(next_box_id)] = box_data
+            next_box_id += 1
+
+    # Ball labels are sourced from tracking data and are kept only on action frames.
+    if has_action_box and ball_position is not None:
+        x, y = ball_position
+        export_boxes[str(next_box_id)] = ball_position_to_box(x, y, frame_width, frame_height)
+
+    return export_boxes
+
+
 def group_consecutive_frames(frame_indices: list[int]) -> list[tuple[int, int]]:
     if not frame_indices:
         return []
@@ -260,10 +382,14 @@ def main() -> int:
     if not video_path.exists():
         raise FileNotFoundError(f"Video file not found: {video_path}")
 
-    yolo_boxes = project.get("annotations", {}).get("yolo_boxes", {})
+    annotations = project.get("annotations", {})
+    yolo_boxes = annotations.get("yolo_boxes", {})
     if not yolo_boxes:
         raise ValueError("Project has no annotations.yolo_boxes to export")
-    ball_positions = load_ball_data(project) if args.ball else None
+    ball_positions = load_ball_data(project)
+    box_classes = {
+        int(class_id): class_name for class_id, class_name in annotations.get("box_classes", {}).items()
+    }
 
     project_name = project.get("name") or project_path.stem
     output_root = data_dir / project_name
@@ -277,6 +403,8 @@ def main() -> int:
         raise RuntimeError(f"Cannot open video: {video_path}")
 
     total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     exported_count = 0
     empty_count = 0
     export_plan = build_export_plan(yolo_boxes, total_frames)
@@ -297,22 +425,32 @@ def main() -> int:
             unit="frame",
             disable=args.no_progress,
         )
+        export_class_counts = {class_id: 0 for class_id in EXPORT_CLASS_NAMES}
         for frame_idx, frame_boxes in progress:
             image = build_grayscale_superframe(
                 gray_frames,
                 frame_idx,
                 total_frames,
-                ball_positions=ball_positions,
+                ball_positions=ball_positions if args.ball else None,
             )
             stem = f"{project_name}_{frame_idx:06d}"
             image_path = images_dir / f"{stem}.jpg"
             label_path = labels_dir / f"{stem}.txt"
+            export_frame_boxes = remap_frame_boxes(
+                frame_boxes,
+                box_classes,
+                frame_width,
+                frame_height,
+                ball_positions.get(frame_idx),
+            )
 
             if not cv2.imwrite(str(image_path), image):
                 raise RuntimeError(f"Failed to write image: {image_path}")
-            write_yolo_label(label_path, frame_boxes)
+            write_yolo_label(label_path, export_frame_boxes)
+            for box_data in export_frame_boxes.values():
+                export_class_counts[int(box_data[0])] += 1
             exported_count += 1
-            if not frame_boxes:
+            if not export_frame_boxes:
                 empty_count += 1
     finally:
         capture.release()
@@ -327,8 +465,11 @@ def main() -> int:
         "num_annotated_samples": exported_count - empty_count,
         "ball_burned": bool(args.ball),
         "ball_marker_diameter_px": BALL_DIAMETER_PX if args.ball else 0,
-        "num_ball_positions": len(ball_positions) if ball_positions is not None else 0,
+        "num_ball_positions": len(ball_positions),
+        "export_class_names": EXPORT_CLASS_NAMES,
+        "export_class_counts": export_class_counts,
     }
+    write_dataset_yaml(output_root)
     with open(output_root / "dataset_manifest.json", "w", encoding="utf-8") as file_obj:
         json.dump(summary, file_obj, indent=2, ensure_ascii=False)
 

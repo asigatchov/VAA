@@ -12,5 +12,6 @@ dependencies = [
     "opencv-python>=4.8.0",
     "pyqt6==6.9.0",
     "pytest>=9.0.1",
+    "rfdetr>=1.6.3",
     "tqdm>=4.67.1",
 ]

@@ -527,13 +527,14 @@ class AnnotationManager:
             return None
 
         ordered_action_types = ["Serve", "Receive", "Set", "Attack"]
+        ordered_action_types_lower = {name.lower() for name in ordered_action_types}
         action_priority = {name: index for index, name in enumerate(ordered_action_types)}
         class_names: List[str] = []
 
         for box_data in boxes.values():
             class_id = int(box_data[0])
             class_name = self.box_classes.get(class_id, f"Class {class_id}")
-            if class_name.lower() == "rally":
+            if class_name.lower() not in ordered_action_types_lower:
                 continue
             class_names.append(class_name)
 

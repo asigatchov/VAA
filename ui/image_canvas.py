@@ -46,12 +46,14 @@ class ImageCanvas(QLabel):
         self.is_resizing = False
         self.corner_grab_distance = 8  # Click target for resize handle
         self.handle_radius = 3
+        self.min_box_size_px = 3
         
         # Clipboard for copy/paste
         self.clipboard_boxes: List[Tuple] = []
         
         # Display settings
         self.show_boxes = True
+        self.visible_box_class_ids: Optional[set[int]] = None
         self.show_ball = True
         self.ball_markup_mode = False
         self.ball_position: Optional[Tuple[float, float]] = None
@@ -91,6 +93,18 @@ class ImageCanvas(QLabel):
     def toggle_boxes_visibility(self, visible: bool):
         """Toggle bounding box visibility."""
         self.show_boxes = visible
+        if not visible:
+            self.selected_box_idx = None
+        self.update()
+
+    def set_visible_box_classes(self, class_ids: Optional[set[int]]):
+        """Restrict visible/editable boxes to the provided class ids."""
+        self.visible_box_class_ids = None if class_ids is None else set(class_ids)
+        if self.selected_box_idx is not None and (
+            self.selected_box_idx >= len(self.boxes) or
+            not self._is_box_visible(self.boxes[self.selected_box_idx])
+        ):
+            self.selected_box_idx = None
         self.update()
 
     def toggle_ball_visibility(self, visible: bool):
@@ -145,6 +159,8 @@ class ImageCanvas(QLabel):
     def _draw_boxes(self, painter: QPainter, x_offset: int, y_offset: int, img_width: int, img_height: int):
         """Draw all bounding boxes."""
         for idx, box in enumerate(self.boxes):
+            if not self._is_box_visible(box):
+                continue
             # Unpack box (handle both old 5-element and new 6-element format)
             if len(box) == 6:
                 cls_id, x_c, y_c, w, h, box_id = box
@@ -372,6 +388,8 @@ class ImageCanvas(QLabel):
         
         # Check each box
         for idx, box in enumerate(self.boxes):
+            if not self._is_box_visible(box):
+                continue
             # Handle both 5 and 6 element boxes
             if len(box) == 6:
                 cls_id, x_c, y_c, w, h, box_id = box
@@ -388,10 +406,17 @@ class ImageCanvas(QLabel):
                 return idx
         
         return None
+
+    def _is_box_visible(self, box: Tuple) -> bool:
+        """Return True if a box should be drawn and editable under current filters."""
+        if self.visible_box_class_ids is None:
+            return True
+        cls_id = int(box[0])
+        return cls_id in self.visible_box_class_ids
     
     def _pixel_rect_to_normalized_box(self, rect: QRect) -> Optional[Tuple]:
         """Convert pixel rectangle to normalized YOLO box format (without ID - will be assigned later)."""
-        if not self.current_pixmap or rect.width() < 5 or rect.height() < 5:
+        if not self.current_pixmap or rect.width() < self.min_box_size_px or rect.height() < self.min_box_size_px:
             return None
         
         # Get image display area
@@ -661,10 +686,11 @@ class ImageCanvas(QLabel):
             new_x_c = orig_x_c + delta_x_norm / 2
             new_y_c = orig_y_c + delta_y_norm / 2
         
-        # Ensure minimum size and valid range
-        min_size = 0.02  # Minimum 2% of frame
-        new_w = max(min_size, min(1.0, new_w))
-        new_h = max(min_size, min(1.0, new_h))
+        # Use a pixel-based minimum so very small objects like the ball remain annotatable.
+        min_w = self.min_box_size_px / max(1, img_width)
+        min_h = self.min_box_size_px / max(1, img_height)
+        new_w = max(min_w, min(1.0, new_w))
+        new_h = max(min_h, min(1.0, new_h))
         
         # Clamp center position
         new_x_c = max(new_w/2, min(1.0 - new_w/2, new_x_c))

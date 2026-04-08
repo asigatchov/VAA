@@ -7,7 +7,7 @@ from datetime import datetime
 import cv2
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QFileDialog, QMessageBox, QLabel, QPushButton,
+    QFileDialog, QMessageBox, QLabel, QPushButton, QCheckBox,
     QStatusBar
 )
 from PyQt6.QtCore import QTimer, Qt, pyqtSlot
@@ -53,6 +53,9 @@ class VideoAnnotationApp(QMainWindow):
         self.is_playing = False
         self.show_superframe = self.ui_config.show_superframe_on_start
         self.show_boxes = self.ui_config.show_boxes_on_start
+        self.show_action_boxes = True
+        self.show_player_boxes = True
+        self.show_ball_boxes = True
         self.playback_speed = self.ui_config.default_playback_speed
         self.playback_step = 1
         
@@ -156,6 +159,21 @@ class VideoAnnotationApp(QMainWindow):
             self.class_combo.addItem(class_name, class_id)
         self.class_combo.currentIndexChanged.connect(self.on_class_selection_changed)
         control_bar.addWidget(self.class_combo)
+
+        self.show_action_boxes_checkbox = QCheckBox("action")
+        self.show_action_boxes_checkbox.setChecked(True)
+        self.show_action_boxes_checkbox.toggled.connect(self.on_box_filter_changed)
+        control_bar.addWidget(self.show_action_boxes_checkbox)
+
+        self.show_player_boxes_checkbox = QCheckBox("player")
+        self.show_player_boxes_checkbox.setChecked(True)
+        self.show_player_boxes_checkbox.toggled.connect(self.on_box_filter_changed)
+        control_bar.addWidget(self.show_player_boxes_checkbox)
+
+        self.show_ball_boxes_checkbox = QCheckBox("ball")
+        self.show_ball_boxes_checkbox.setChecked(True)
+        self.show_ball_boxes_checkbox.toggled.connect(self.on_box_filter_changed)
+        control_bar.addWidget(self.show_ball_boxes_checkbox)
         
         self.time_label = QLabel("00:00.0 / 00:00.0")
         self.time_label.setStyleSheet("font-family: monospace; font-size: 14px;")
@@ -467,6 +485,7 @@ class VideoAnnotationApp(QMainWindow):
         """Toggle bounding box visibility."""
         self.show_boxes = (state == Qt.CheckState.Checked.value)
         self.canvas.toggle_boxes_visibility(self.show_boxes)
+        self._apply_box_class_filters()
 
     def toggle_ball(self, state):
         """Toggle ball marker visibility."""
@@ -479,6 +498,40 @@ class VideoAnnotationApp(QMainWindow):
         self.status_bar.showMessage(
             "Ball markup mode enabled: click frame to set ball position" if enabled else "Ball markup mode disabled"
         )
+
+    def on_box_filter_changed(self, _checked: bool):
+        """Update action/player/ball box visibility filters."""
+        self.show_action_boxes = self.show_action_boxes_checkbox.isChecked()
+        self.show_player_boxes = self.show_player_boxes_checkbox.isChecked()
+        self.show_ball_boxes = self.show_ball_boxes_checkbox.isChecked()
+        self._apply_box_class_filters()
+
+    def _apply_box_class_filters(self):
+        """Apply per-class visibility filters for canvas box rendering/editing."""
+        visible_class_ids = set(self.annot_config.box_classes.keys())
+
+        player_class_id = next(
+            (class_id for class_id, class_name in self.annot_config.box_classes.items() if class_name == "player"),
+            None,
+        )
+        ball_class_id = next(
+            (class_id for class_id, class_name in self.annot_config.box_classes.items() if class_name == "ball"),
+            None,
+        )
+        action_class_ids = {
+            class_id
+            for class_id, class_name in self.annot_config.box_classes.items()
+            if class_name in self.annot_config.action_types
+        }
+
+        if not self.show_action_boxes:
+            visible_class_ids.difference_update(action_class_ids)
+        if player_class_id is not None and not self.show_player_boxes:
+            visible_class_ids.discard(player_class_id)
+        if ball_class_id is not None and not self.show_ball_boxes:
+            visible_class_ids.discard(ball_class_id)
+
+        self.canvas.set_visible_box_classes(visible_class_ids)
     
    
     def on_class_selection_changed(self, index):
