@@ -456,5 +456,22 @@ class TestClearFrame:
         manager.clear_frame_boxes(999)
 
 
+def test_clear_boxes_by_class_ids_in_range_removes_only_matching_classes():
+    manager = AnnotationManager({0: "Serve", 2: "Set", 5: "player", 6: "ball"})
+    manager.add_yolo_box(10, (2, 0.5, 0.5, 0.1, 0.1))
+    manager.add_yolo_box(10, (5, 0.5, 0.5, 0.1, 0.1))
+    manager.add_yolo_box(10, (6, 0.5, 0.5, 0.02, 0.02))
+    manager.add_yolo_box(11, (0, 0.5, 0.5, 0.1, 0.1))
+    manager.add_yolo_box(11, (5, 0.5, 0.5, 0.1, 0.1))
+
+    result = manager.clear_boxes_by_class_ids_in_range(10, 11, {5, 6})
+
+    assert result == {"frames_cleared": 2, "boxes_removed": 3}
+    frame10_classes = sorted(int(box[0]) for box in manager.yolo_boxes[10].values())
+    frame11_classes = sorted(int(box[0]) for box in manager.yolo_boxes[11].values())
+    assert frame10_classes == [2]
+    assert frame11_classes == [0]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

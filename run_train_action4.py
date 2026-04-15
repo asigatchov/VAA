@@ -1,18 +1,19 @@
-from rfdetr import RFDETRMedium
+from rfdetr import RFDETRMedium, RFDETRNano
 
 
 DATASET_PATH = "/home/nssd/gled/vb/dataset-action4/"
 
 DATASET_PATH = "datasets-coco-split/"
 
-MYMODEL_DIR = "./model_action4_20260408_02"
+MYMODEL_DIR = "./model_action4_nano_20260410_01"
 
-model = RFDETRMedium()
+# model = RFDETRMedium()
+model = RFDETRNano()
 model.train(
     dataset_dir=DATASET_PATH,
     epochs=70,
-    batch_size=6,
-    grad_accum_steps=6,
+    batch_size=10,
+    grad_accum_steps=10,
     lr=1e-4,
     output_dir=MYMODEL_DIR,
     aug_config={

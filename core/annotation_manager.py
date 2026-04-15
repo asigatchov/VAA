@@ -208,6 +208,52 @@ class AnnotationManager:
             "boxes_removed": boxes_removed,
         }
 
+    def clear_boxes_by_class_ids_in_range(
+        self,
+        start_frame: int,
+        end_frame: int,
+        class_ids: set[int],
+    ) -> Dict[str, int]:
+        """Clear only boxes matching class_ids inside an inclusive frame range."""
+        if not class_ids:
+            return {"frames_cleared": 0, "boxes_removed": 0}
+
+        frames_cleared = 0
+        boxes_removed = 0
+
+        for frame_idx in sorted(list(self.yolo_boxes.keys())):
+            if frame_idx < start_frame or frame_idx > end_frame:
+                continue
+
+            frame_boxes = self.yolo_boxes.get(frame_idx, {})
+            removable_box_ids = [
+                box_id
+                for box_id, box_data in frame_boxes.items()
+                if int(box_data[0]) in class_ids
+            ]
+            if not removable_box_ids:
+                continue
+
+            for box_id in removable_box_ids:
+                del frame_boxes[box_id]
+                boxes_removed += 1
+
+            frames_cleared += 1
+            if not frame_boxes:
+                del self.yolo_boxes[frame_idx]
+
+        if boxes_removed:
+            self._rebuild_actions()
+            logger.info(
+                f"Cleared {boxes_removed} boxes across {frames_cleared} frames "
+                f"for classes {sorted(class_ids)} in range {start_frame}-{end_frame}"
+            )
+
+        return {
+            "frames_cleared": frames_cleared,
+            "boxes_removed": boxes_removed,
+        }
+
     def export_yolo(self, output_dir: str) -> int:
         """Export YOLO format annotations."""
         labels_dir = os.path.join(output_dir, "labels")

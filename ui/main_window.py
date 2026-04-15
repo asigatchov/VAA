@@ -2,19 +2,21 @@
 from typing import Optional
 import csv
 import json
+import subprocess
 from pathlib import Path
 from datetime import datetime
 import cv2
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QFileDialog, QMessageBox, QLabel, QPushButton, QCheckBox,
-    QStatusBar
+    QStatusBar, QComboBox, QApplication, QProgressDialog
 )
 from PyQt6.QtCore import QTimer, Qt, pyqtSlot
 from PyQt6.QtGui import QAction, QKeySequence, QImage, QPixmap
 
 from core.video_processor import VideoProcessor
 from core.annotation_manager import AnnotationManager
+from core.assistant_annotator import AssistantAnnotator
 from core.yolo_tracker import YOLOTracker
 from config import AnnotationConfig, UIConfig
 from ui.image_canvas import ImageCanvas
@@ -38,6 +40,7 @@ class VideoAnnotationApp(QMainWindow):
         self.processor: Optional[VideoProcessor] = None
         self.annotations = AnnotationManager(self.annot_config.box_classes)
         self.yolo_tracker: Optional[YOLOTracker] = None
+        self.assistant_annotator = AssistantAnnotator()
         self.projects_dir = Path(__file__).resolve().parents[1] / "projects"
         self.current_project_dir: Optional[Path] = None
         self.current_project_json: Optional[Path] = None
@@ -47,6 +50,7 @@ class VideoAnnotationApp(QMainWindow):
         self.current_ball_data = []
         self.current_ball_lookup = {}
         self.selected_rally_id: Optional[int] = None
+        self.auto_distill_model_variant = "medium"
         
         # State
         self.current_frame_idx = 0
@@ -96,6 +100,7 @@ class VideoAnnotationApp(QMainWindow):
         self.canvas.box_class_changed.connect(self.on_box_class_changed)
         self.canvas.box_geometry_changed.connect(self.on_box_geometry_changed)
         self.canvas.ball_point_set.connect(self.on_ball_point_set)
+        self.canvas.assistant_click_requested.connect(self.on_assistant_click)
         left_panel.addWidget(self.canvas, stretch=1)
         
         # Control bar
@@ -153,7 +158,6 @@ class VideoAnnotationApp(QMainWindow):
         
         # Add class selector for drawing
         control_bar.addWidget(QLabel("Draw Class:"))
-        from PyQt6.QtWidgets import QComboBox
         self.class_combo = QComboBox()
         for class_id, class_name in sorted(self.annot_config.box_classes.items()):
             self.class_combo.addItem(class_name, class_id)
@@ -220,6 +224,31 @@ class VideoAnnotationApp(QMainWindow):
         self.export_btn.setStyleSheet("background-color: #007bff; color: white; font-weight: bold; padding: 10px;")
         self.export_btn.setEnabled(False)
         right_panel.addWidget(self.export_btn)
+
+        auto_distill_label = QLabel("Auto-Distill")
+        auto_distill_label.setStyleSheet("font-weight: bold; margin-top: 8px;")
+        right_panel.addWidget(auto_distill_label)
+
+        auto_distill_controls = QHBoxLayout()
+        self.auto_distill_variant_combo = QComboBox()
+        self.auto_distill_variant_combo.addItem("RF-DETR Nano", "nano")
+        self.auto_distill_variant_combo.addItem("RF-DETR Medium", "medium")
+        self.auto_distill_variant_combo.addItem("RF-DETR Base", "base")
+        self.auto_distill_variant_combo.setCurrentIndex(1)
+        self.auto_distill_variant_combo.currentIndexChanged.connect(self.on_auto_distill_variant_changed)
+        self.auto_distill_variant_combo.setEnabled(False)
+        auto_distill_controls.addWidget(self.auto_distill_variant_combo, stretch=1)
+
+        self.auto_distill_btn = QPushButton("Run via uv")
+        self.auto_distill_btn.clicked.connect(self.run_auto_distill)
+        self.auto_distill_btn.setEnabled(False)
+        auto_distill_controls.addWidget(self.auto_distill_btn)
+        right_panel.addLayout(auto_distill_controls)
+
+        self.auto_distill_hint = QLabel("Annotates COCO person -> player and sports ball -> ball for action frames.")
+        self.auto_distill_hint.setStyleSheet("color: #8fa1b7; font-size: 11px;")
+        self.auto_distill_hint.setWordWrap(True)
+        right_panel.addWidget(self.auto_distill_hint)
         
         main_layout.addLayout(right_panel, stretch=3)
     
@@ -384,6 +413,11 @@ class VideoAnnotationApp(QMainWindow):
         paste_shortcut.setShortcut("Ctrl+V")
         paste_shortcut.triggered.connect(self.paste_boxes)
         self.addAction(paste_shortcut)
+
+        clear_frame_boxes_shortcut = QAction(self)
+        clear_frame_boxes_shortcut.setShortcut("Shift+Delete")
+        clear_frame_boxes_shortcut.triggered.connect(self.clear_current_frame_boxes)
+        self.addAction(clear_frame_boxes_shortcut)
     
     # Video loading and playback methods
     
@@ -553,6 +587,13 @@ class VideoAnnotationApp(QMainWindow):
         """Update frame increment used during playback."""
         self.playback_step = max(1, min(30, int(step)))
         self.status_bar.showMessage(f"Playback step set to {self.playback_step} frame(s)")
+
+    def on_auto_distill_variant_changed(self, index: int):
+        """Update the selected RF-DETR variant for auto-distillation."""
+        variant = self.auto_distill_variant_combo.itemData(index)
+        if variant:
+            self.auto_distill_model_variant = str(variant)
+            self.status_bar.showMessage(f"Auto-distill model set to RF-DETR {self.auto_distill_model_variant.title()}")
 
     def on_rally_selected(self, rally_id: int):
         """Track selected rally for detail timeline."""
@@ -946,6 +987,98 @@ class VideoAnnotationApp(QMainWindow):
         self._save_project_state()
         self.status_bar.showMessage(f"Ball marked at frame {self.current_frame_idx}: ({source_x}, {source_y})")
         self.update_display()
+
+    def on_assistant_click(self, x_norm: float, y_norm: float):
+        """Auto-annotate a 9-frame action clip around the clicked player center."""
+        if not self.processor:
+            return
+
+        action_type = self.action_panel.selected_action_type
+        action_class_id = next(
+            (
+                class_id for class_id, class_name in self.annot_config.box_classes.items()
+                if class_name == action_type
+            ),
+            None,
+        )
+        player_class_id = next(
+            (
+                class_id for class_id, class_name in self.annot_config.box_classes.items()
+                if class_name == "player"
+            ),
+            None,
+        )
+        ball_class_id = next(
+            (
+                class_id for class_id, class_name in self.annot_config.box_classes.items()
+                if class_name == "ball"
+            ),
+            None,
+        )
+
+        if action_class_id is None or player_class_id is None or ball_class_id is None:
+            QMessageBox.warning(
+                self,
+                "Assistant Markup",
+                "Required classes are missing. Expected action type, 'player', and 'ball' classes."
+            )
+            return
+
+        clip_start = max(0, self.current_frame_idx - self.assistant_annotator.clip_radius)
+        clip_end = min(self.processor.total_frames - 1, self.current_frame_idx + self.assistant_annotator.clip_radius)
+        total_clip_frames = clip_end - clip_start + 1
+
+        progress_dialog = QProgressDialog("Assistant markup: preparing detection...", None, 0, total_clip_frames, self)
+        progress_dialog.setWindowTitle("Assistant Markup")
+        progress_dialog.setMinimumDuration(0)
+        progress_dialog.setAutoClose(True)
+        progress_dialog.setAutoReset(True)
+        progress_dialog.setCancelButton(None)
+        progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        progress_dialog.setValue(0)
+
+        def update_progress(done: int, total: int, frame_idx: int):
+            total = max(1, int(total))
+            progress_dialog.setMaximum(total)
+            progress_dialog.setLabelText(f"Assistant markup: detecting frame {min(done + 1, total)}/{total} (frame {frame_idx})")
+            progress_dialog.setValue(min(done, total))
+            self.status_bar.showMessage(f"Assistant markup running: {min(done + 1, total)}/{total} frames")
+            QApplication.processEvents()
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            result = self.assistant_annotator.annotate_clip(
+                processor=self.processor,
+                annotations=self.annotations,
+                ball_lookup=self.current_ball_lookup,
+                center_frame=self.current_frame_idx,
+                click_center=(x_norm, y_norm),
+                action_class_id=action_class_id,
+                player_class_id=player_class_id,
+                ball_class_id=ball_class_id,
+                replace_existing=True,
+                progress_callback=update_progress,
+            )
+            progress_dialog.setValue(total_clip_frames)
+        finally:
+            QApplication.restoreOverrideCursor()
+            progress_dialog.close()
+
+        if not result.get("ok"):
+            QMessageBox.warning(self, "Assistant Markup", "Failed to build clip annotation.")
+            return
+
+        for frame_idx, coords in result.get("ball_points", {}).items():
+            self._upsert_ball_point(int(frame_idx), int(coords[0]), int(coords[1]))
+
+        self._refresh_annotation_views()
+        self._save_project_state()
+        self.update_display()
+        created_rally = "created" if result.get("created_rally") else "reused"
+        self.status_bar.showMessage(
+            f"Assistant clip {result['start_frame']}-{result['end_frame']} for {action_type} via Shift+Click: "
+            f"{result['boxes_created']} boxes, rally {created_rally}"
+        )
         
     def copy_boxes(self):
         """Copy all boxes from current frame to clipboard (Ctrl+C)."""
@@ -988,6 +1121,24 @@ class VideoAnnotationApp(QMainWindow):
         self.update_display()
         self.status_bar.showMessage(f"Pasted {len(clipboard_boxes)} boxes to frame {self.current_frame_idx} (IDs: {', '.join(map(str, pasted_ids))})")
         logger.info(f"Pasted {len(clipboard_boxes)} boxes to frame {self.current_frame_idx} with new IDs: {pasted_ids}")
+
+    def clear_current_frame_boxes(self):
+        """Remove all boxes from the current frame."""
+        if not self.processor:
+            return
+
+        frame_boxes = self.annotations.yolo_boxes.get(self.current_frame_idx, {})
+        if not frame_boxes:
+            self.status_bar.showMessage(f"No boxes on frame {self.current_frame_idx}")
+            return
+
+        removed_count = len(frame_boxes)
+        self.annotations.clear_frame_boxes(self.current_frame_idx)
+        self._refresh_annotation_views()
+        self._save_project_state()
+        self.update_display()
+        self.status_bar.showMessage(f"Removed {removed_count} boxes from frame {self.current_frame_idx}")
+        logger.info(f"Cleared {removed_count} boxes from frame {self.current_frame_idx} via Shift+Delete")
     
     # Export methods
     
@@ -1044,6 +1195,67 @@ class VideoAnnotationApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Failed to export annotations:\n{str(e)}")
             logger.error(f"Export failed: {e}")
+
+    def run_auto_distill(self):
+        """Run project auto-distillation for player and ball annotations through uv."""
+        if not self.current_project_json:
+            QMessageBox.warning(self, "Auto-Distill", "Please load a project or video first.")
+            return
+
+        self._save_project_state()
+        project_path = self.current_project_json.resolve()
+        repo_root = Path(__file__).resolve().parents[1]
+        variant_label = self.auto_distill_model_variant.title()
+        command = [
+            "uv",
+            "run",
+            "python",
+            "annotate_action_players_ball_rfdetr.py",
+            "--project",
+            str(project_path),
+            "--model-variant",
+            self.auto_distill_model_variant,
+        ]
+
+        self.status_bar.showMessage(f"Running auto-distill via uv: RF-DETR {variant_label}")
+        self.auto_distill_btn.setEnabled(False)
+        self.auto_distill_variant_combo.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        try:
+            result = subprocess.run(
+                command,
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Auto-Distill Error", f"Failed to start uv run:\n{exc}")
+            logger.error(f"Auto-distill launch failed: {exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.auto_distill_btn.setEnabled(self.processor is not None)
+            self.auto_distill_variant_combo.setEnabled(self.processor is not None)
+
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        if result.returncode != 0:
+            details = stderr or stdout or "No output from command."
+            QMessageBox.critical(
+                self,
+                "Auto-Distill Error",
+                f"uv run failed with exit code {result.returncode}.\n\n{details[:3000]}",
+            )
+            logger.error(f"Auto-distill failed: code={result.returncode} stderr={stderr} stdout={stdout}")
+            return
+
+        self._load_project_state(project_path)
+        self._refresh_annotation_views()
+        self.update_display()
+        self.status_bar.showMessage(f"Auto-distill finished with RF-DETR {variant_label}")
+        logger.info(f"Auto-distill completed: variant={self.auto_distill_model_variant} project={project_path}")
     
     def show_about(self):
         """Show about dialog."""
@@ -1154,6 +1366,8 @@ class VideoAnnotationApp(QMainWindow):
         self.prev_annotated_btn.setEnabled(True)
         self.next_annotated_btn.setEnabled(True)
         self.export_btn.setEnabled(True)
+        self.auto_distill_btn.setEnabled(True)
+        self.auto_distill_variant_combo.setEnabled(True)
         self._refresh_annotation_views()
         self.detail_timeline.set_total_frames(self.processor.total_frames)
         self.update_display()
@@ -1288,6 +1502,18 @@ class VideoAnnotationApp(QMainWindow):
         """Get current frame ball position normalized to source frame."""
         if not self.processor:
             return None
+
+        ball_class_id = next(
+            (
+                class_id for class_id, class_name in self.annot_config.box_classes.items()
+                if class_name == "ball"
+            ),
+            None,
+        )
+        if ball_class_id is not None:
+            frame_boxes = self.annotations.yolo_boxes.get(self.current_frame_idx, {})
+            if any(int(box_data[0]) == int(ball_class_id) for box_data in frame_boxes.values()):
+                return None
 
         row = self.current_ball_lookup.get(self.current_frame_idx)
         if not row:

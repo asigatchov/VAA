@@ -16,6 +16,7 @@ class ImageCanvas(QLabel):
     box_class_changed = pyqtSignal(int, int)  # Emits (box_id_or_index, new_class_id)
     box_geometry_changed = pyqtSignal(int, float, float, float, float, int)  # box_index, x, y, w, h, box_id
     ball_point_set = pyqtSignal(float, float)  # Emits normalized x, y
+    assistant_click_requested = pyqtSignal(float, float)  # Emits normalized x, y
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -115,7 +116,7 @@ class ImageCanvas(QLabel):
     def set_ball_markup_mode(self, enabled: bool):
         """Enable or disable ball markup mode."""
         self.ball_markup_mode = enabled
-    
+
     def paintEvent(self, event):
         """Override paint event to draw image and bounding boxes."""
         super().paintEvent(event)
@@ -232,6 +233,13 @@ class ImageCanvas(QLabel):
     def mousePressEvent(self, event: QMouseEvent):
         """Handle mouse press for box creation/selection/resizing."""
         pos = event.pos()
+        modifiers = event.modifiers()
+
+        if event.button() == Qt.MouseButton.LeftButton and bool(modifiers & Qt.KeyboardModifier.ShiftModifier):
+            click_point = self._point_to_normalized(pos)
+            if click_point is not None:
+                self.assistant_click_requested.emit(click_point[0], click_point[1])
+            return
 
         if event.button() == Qt.MouseButton.LeftButton and self.ball_markup_mode:
             ball_point = self._point_to_normalized(pos)
