@@ -7,12 +7,28 @@ from typing import Callable, Dict, Optional, Tuple
 import numpy as np
 import rfdetr
 from rfdetr.assets.coco_classes import COCO_CLASSES
+from supervision import Detections as SupervisionDetections
 
 from core.annotation_manager import AnnotationManager
 
 
 PERSON_CLASS_NAME = "person"
 BALL_CLASS_NAME = "sports ball"
+
+
+def _ensure_rfdetr_supervision_compat() -> None:
+    """Provide the metadata API expected by newer RF-DETR on older supervision."""
+    if hasattr(SupervisionDetections, "data"):
+        return
+
+    def _get_data(self) -> dict:
+        data = self.__dict__.get("_compat_data")
+        if data is None:
+            data = {}
+            self.__dict__["_compat_data"] = data
+        return data
+
+    SupervisionDetections.data = property(_get_data)
 
 
 @dataclass(frozen=True)
@@ -28,11 +44,16 @@ class AssistantAnnotator:
 
     clip_radius: int = 4
     crop_size_px: Tuple[int, int] = (960, 540)
+    crop_mode: str = "crop"
+    detector_backend: str = "rfdetr_medium"
     model_variant: str = "medium"
     resolution: int = 640
     person_threshold: float = 0.55
     ball_threshold: float = 0.12
     _model: object | None = field(default=None, init=False, repr=False)
+    _model_backend: str | None = field(default=None, init=False, repr=False)
+    _model_variant: str | None = field(default=None, init=False, repr=False)
+    _model_resolution: int | None = field(default=None, init=False, repr=False)
 
     def annotate_clip(
         self,
@@ -46,10 +67,42 @@ class AssistantAnnotator:
         ball_class_id: int,
         replace_existing: bool = True,
         progress_callback: Optional[Callable[[int, int, int], None]] = None,
+        status_callback: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, object]:
         """Annotate a 9-frame clip centered on center_frame."""
         del ball_lookup
+        try:
+            return self._annotate_clip_impl(
+                processor=processor,
+                annotations=annotations,
+                center_frame=center_frame,
+                click_center=click_center,
+                action_class_id=action_class_id,
+                player_class_id=player_class_id,
+                ball_class_id=ball_class_id,
+                replace_existing=replace_existing,
+                progress_callback=progress_callback,
+                status_callback=status_callback,
+            )
+        except RuntimeError as exc:
+            return {"ok": False, "reason": "model_error", "message": str(exc)}
+        except Exception as exc:
+            return {"ok": False, "reason": "assistant_error", "message": str(exc)}
 
+    def _annotate_clip_impl(
+        self,
+        processor,
+        annotations: AnnotationManager,
+        center_frame: int,
+        click_center: Tuple[float, float],
+        action_class_id: int,
+        player_class_id: int,
+        ball_class_id: int,
+        replace_existing: bool = True,
+        progress_callback: Optional[Callable[[int, int, int], None]] = None,
+        status_callback: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, object]:
+        """Internal annotate implementation."""
         total_frames = int(getattr(processor, "total_frames", 0))
         if total_frames <= 0:
             return {"ok": False, "reason": "no_frames"}
@@ -62,7 +115,7 @@ class AssistantAnnotator:
         start_frame = max(0, int(center_frame) - self.clip_radius)
         end_frame = min(total_frames - 1, int(center_frame) + self.clip_radius)
 
-        player_detection = self._pick_player_detection(center_image, click_center)
+        player_detection = self._pick_player_detection(center_image, click_center, status_callback=status_callback)
         if player_detection is None:
             return {"ok": False, "reason": "no_player_detection"}
 
@@ -93,6 +146,7 @@ class AssistantAnnotator:
                 frame_image,
                 previous_player_center,
                 threshold=min(self.person_threshold, self.ball_threshold),
+                status_callback=status_callback,
             )
             player_detection_frame = self._pick_player_detection_from_detections(
                 frame_detections,
@@ -144,11 +198,29 @@ class AssistantAnnotator:
             "ball_points": ball_points,
             "created_rally": created_rally,
             "model_variant": self.model_variant,
+            "detector_backend": self.detector_backend,
         }
 
-    def _get_model(self):
-        if self._model is not None:
+    def _get_model(self, status_callback: Optional[Callable[[str], None]] = None):
+        if (
+            self._model is not None
+            and self._model_backend == self.detector_backend
+            and self._model_variant == self.model_variant
+            and self._model_resolution == self.resolution
+        ):
             return self._model
+
+        self._model = None
+        self._model_backend = None
+        self._model_variant = None
+        self._model_resolution = None
+
+        if self.detector_backend != "rfdetr_medium":
+            raise RuntimeError(f"Unsupported assistant detector backend: {self.detector_backend}")
+
+        _ensure_rfdetr_supervision_compat()
+        if status_callback is not None:
+            status_callback("RF-DETR: loading model...")
 
         class_name = {
             "nano": "RFDETRNano",
@@ -161,10 +233,19 @@ class AssistantAnnotator:
 
         self._model = model_cls(resolution=self.resolution)
         self._model.optimize_for_inference()
+        self._model_backend = self.detector_backend
+        self._model_variant = self.model_variant
+        self._model_resolution = self.resolution
         return self._model
 
-    def _predict(self, frame_bgr: np.ndarray, threshold: float) -> list[Detection]:
-        model = self._get_model()
+    def _predict(
+        self,
+        frame_bgr: np.ndarray,
+        threshold: float,
+        status_callback: Optional[Callable[[str], None]] = None,
+    ) -> list[Detection]:
+        model = self._get_model(status_callback=status_callback)
+
         rgb = np.ascontiguousarray(frame_bgr[:, :, ::-1])
         detections = model.predict(rgb, threshold=threshold)
         if detections.xyxy is None:
@@ -186,7 +267,11 @@ class AssistantAnnotator:
         frame_bgr: np.ndarray,
         center_norm: Tuple[float, float],
         threshold: float,
+        status_callback: Optional[Callable[[str], None]] = None,
     ) -> list[Detection]:
+        if self.crop_mode == "full_frame":
+            return self._predict(frame_bgr, threshold=threshold, status_callback=status_callback)
+
         frame_height, frame_width = frame_bgr.shape[:2]
         x1, y1, x2, y2 = self._build_crop_rect(
             frame_width=frame_width,
@@ -198,7 +283,7 @@ class AssistantAnnotator:
         if crop.size == 0:
             return []
 
-        detections = self._predict(crop, threshold=threshold)
+        detections = self._predict(crop, threshold=threshold, status_callback=status_callback)
         remapped: list[Detection] = []
         for detection in detections:
             dx1, dy1, dx2, dy2 = detection.xyxy
@@ -215,12 +300,14 @@ class AssistantAnnotator:
         self,
         frame_bgr: np.ndarray,
         click_center: Tuple[float, float],
+        status_callback: Optional[Callable[[str], None]] = None,
     ) -> Optional[Detection]:
         frame_height, frame_width = frame_bgr.shape[:2]
         detections = self._predict_in_crop(
             frame_bgr,
             click_center,
             threshold=min(self.person_threshold, self.ball_threshold),
+            status_callback=status_callback,
         )
         click_x = float(click_center[0]) * frame_width
         click_y = float(click_center[1]) * frame_height

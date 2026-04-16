@@ -27,12 +27,12 @@ class StubAssistantAnnotator(AssistantAnnotator):
         super().__init__(**kwargs)
         self._detections = list(detections)
 
-    def _predict(self, frame_bgr: np.ndarray, threshold: float) -> list[Detection]:
-        del frame_bgr
+    def _predict(self, frame_bgr: np.ndarray, threshold: float, status_callback=None) -> list[Detection]:
+        del frame_bgr, status_callback
         return [item for item in self._detections if item.confidence >= threshold]
 
-    def _predict_in_crop(self, frame_bgr: np.ndarray, center_norm, threshold: float) -> list[Detection]:
-        del frame_bgr, center_norm
+    def _predict_in_crop(self, frame_bgr: np.ndarray, center_norm, threshold: float, status_callback=None) -> list[Detection]:
+        del frame_bgr, center_norm, status_callback
         return [item for item in self._detections if item.confidence >= threshold]
 
 
@@ -41,13 +41,14 @@ class FrameAwareStubAssistantAnnotator(AssistantAnnotator):
         super().__init__(**kwargs)
         self._detections_by_frame = detections_by_frame
 
-    def _predict(self, frame_bgr: np.ndarray, threshold: float) -> list[Detection]:
+    def _predict(self, frame_bgr: np.ndarray, threshold: float, status_callback=None) -> list[Detection]:
+        del status_callback
         frame_idx = int(frame_bgr[0, 0, 0])
         detections = self._detections_by_frame.get(frame_idx, [])
         return [item for item in detections if item.confidence >= threshold]
 
-    def _predict_in_crop(self, frame_bgr: np.ndarray, center_norm, threshold: float) -> list[Detection]:
-        del center_norm
+    def _predict_in_crop(self, frame_bgr: np.ndarray, center_norm, threshold: float, status_callback=None) -> list[Detection]:
+        del center_norm, status_callback
         frame_idx = int(frame_bgr[0, 0, 0])
         detections = self._detections_by_frame.get(frame_idx, [])
         return [item for item in detections if item.confidence >= threshold]
