@@ -8,7 +8,7 @@ import cv2
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QFileDialog, QMessageBox, QLabel, QPushButton, QCheckBox,
-    QStatusBar, QComboBox, QApplication, QProgressDialog
+    QStatusBar, QComboBox, QApplication, QProgressDialog, QSpinBox
 )
 from PyQt6.QtCore import QTimer, Qt, pyqtSlot
 from PyQt6.QtGui import QAction, QKeySequence, QImage, QPixmap
@@ -49,6 +49,10 @@ class VideoAnnotationApp(QMainWindow):
         self.current_ball_data = []
         self.current_ball_lookup = {}
         self.selected_rally_id: Optional[int] = None
+        self.mixformer_target_frame_idx: Optional[int] = None
+        self.mixformer_seed_frame_idx: Optional[int] = None
+        self.mixformer_ball_seed_box: Optional[tuple[float, float, float, float]] = None
+        self.mixformer_pending_step: Optional[str] = None
         
         # State
         self.current_frame_idx = 0
@@ -222,6 +226,7 @@ class VideoAnnotationApp(QMainWindow):
 
         self.assistant_model_combo = QComboBox()
         self.assistant_model_combo.addItem("RF-DETR Medium", "rfdetr_medium")
+        self.assistant_model_combo.addItem("MixFormerV2 ONNX", "mixformer_v2_onnx")
         self.assistant_model_combo.currentIndexChanged.connect(self.on_assistant_model_changed)
         right_panel.addWidget(self.assistant_model_combo)
 
@@ -234,6 +239,16 @@ class VideoAnnotationApp(QMainWindow):
         self.assistant_crop_combo.addItem("Front Plan: Full Frame", "full_frame")
         self.assistant_crop_combo.currentIndexChanged.connect(self.on_assistant_crop_changed)
         right_panel.addWidget(self.assistant_crop_combo)
+
+        assistant_radius_label = QLabel("Assistant Radius")
+        assistant_radius_label.setStyleSheet("font-weight: bold; margin-top: 8px;")
+        right_panel.addWidget(assistant_radius_label)
+
+        self.assistant_radius_spin = QSpinBox()
+        self.assistant_radius_spin.setRange(1, 30)
+        self.assistant_radius_spin.setValue(self.assistant_annotator.clip_radius)
+        self.assistant_radius_spin.valueChanged.connect(self.on_assistant_radius_changed)
+        right_panel.addWidget(self.assistant_radius_spin)
         
         # Export button
         self.export_btn = QPushButton("💾 Export Annotations")
@@ -584,6 +599,7 @@ class VideoAnnotationApp(QMainWindow):
         """Update active assistant auto-label model."""
         backend = self.assistant_model_combo.itemData(index)
         if backend:
+            self._clear_mixformer_seed_selection()
             self.assistant_annotator.detector_backend = str(backend)
             label = self.assistant_model_combo.currentText()
             self.status_bar.showMessage(f"Assistant auto-label model set to {label}")
@@ -595,6 +611,12 @@ class VideoAnnotationApp(QMainWindow):
             self.assistant_annotator.crop_mode = str(crop_mode)
             label = self.assistant_crop_combo.currentText()
             self.status_bar.showMessage(f"Assistant crop mode set to {label}")
+
+    def on_assistant_radius_changed(self, value: int):
+        """Update assistant clip radius."""
+        self.assistant_annotator.clip_radius = max(1, int(value))
+        clip_len = self.assistant_annotator.clip_radius * 2 + 1
+        self.status_bar.showMessage(f"Assistant clip radius set to {self.assistant_annotator.clip_radius} ({clip_len} frames)")
 
     def on_rally_selected(self, rally_id: int):
         """Track selected rally for detail timeline."""
@@ -1025,8 +1047,87 @@ class VideoAnnotationApp(QMainWindow):
             )
             return
 
-        clip_start = max(0, self.current_frame_idx - self.assistant_annotator.clip_radius)
-        clip_end = min(self.processor.total_frames - 1, self.current_frame_idx + self.assistant_annotator.clip_radius)
+        seed_boxes = None
+        if self.assistant_annotator.detector_backend == "mixformer_v2_onnx":
+            if self.mixformer_pending_step is None:
+                self.mixformer_target_frame_idx = self.current_frame_idx
+                self.mixformer_seed_frame_idx = max(0, self.current_frame_idx - self.assistant_annotator.clip_radius)
+                self.mixformer_pending_step = "ball"
+                self.mixformer_ball_seed_box = None
+                self._set_draw_class_by_name("ball")
+                self.seek(self.mixformer_seed_frame_idx)
+                QMessageBox.information(
+                    self,
+                    "MixFormerV2",
+                    (
+                        f"Клип будет построен от кадра {self.mixformer_seed_frame_idx} до "
+                        f"{self.mixformer_seed_frame_idx + self.assistant_annotator.clip_radius * 2}.\n\n"
+                        "Шаг 1: выделите box мяча на текущем кадре через Shift+Click."
+                    ),
+                )
+                return
+
+            if self.mixformer_seed_frame_idx != self.current_frame_idx:
+                self._clear_mixformer_seed_selection()
+                QMessageBox.warning(
+                    self,
+                    "MixFormerV2",
+                    "Для подтверждения seed-боксов вернитесь на стартовый кадр клипа и повторите шаги ball -> player."
+                )
+                return
+
+            if self.mixformer_pending_step == "ball":
+                ball_seed = self._capture_mixformer_seed_box("ball", x_norm, y_norm)
+                if ball_seed is None:
+                    QMessageBox.warning(
+                        self,
+                        "MixFormerV2",
+                        "Шаг 1: сначала нарисуйте или выберите box мяча, затем Shift+Click по нему."
+                    )
+                    return
+                self.mixformer_seed_frame_idx = self.current_frame_idx
+                self.mixformer_ball_seed_box = ball_seed
+                self.mixformer_pending_step = "player"
+                self._set_draw_class_by_name("player")
+                QMessageBox.information(
+                    self,
+                    "MixFormerV2",
+                    "Шаг 2: выделите box игрока на этом же кадре через Shift+Click."
+                )
+                return
+
+            player_seed = self._capture_mixformer_seed_box("player", x_norm, y_norm)
+            if player_seed is None:
+                QMessageBox.warning(
+                    self,
+                    "MixFormerV2",
+                    "Шаг 2: сначала нарисуйте или выберите box игрока, затем Shift+Click по нему."
+                )
+                return
+
+            seed_boxes = {
+                "ball": self.mixformer_ball_seed_box,
+                "player": player_seed,
+            }
+            if self.mixformer_target_frame_idx is None or self.mixformer_seed_frame_idx is None:
+                QMessageBox.warning(self, "MixFormerV2", "Сброшено состояние seed-выбора. Повторите шаги заново.")
+                self._clear_mixformer_seed_selection()
+                return
+
+        if self.assistant_annotator.detector_backend == "mixformer_v2_onnx" and self.mixformer_seed_frame_idx is not None:
+            clip_start = self.mixformer_seed_frame_idx
+            clip_end = min(self.processor.total_frames - 1, clip_start + self.assistant_annotator.clip_radius * 2)
+            run_center_frame = max(
+                clip_start,
+                min(
+                    self.processor.total_frames - 1,
+                    self.mixformer_target_frame_idx if self.mixformer_target_frame_idx is not None else clip_start + self.assistant_annotator.clip_radius,
+                ),
+            )
+        else:
+            clip_start = max(0, self.current_frame_idx - self.assistant_annotator.clip_radius)
+            clip_end = min(self.processor.total_frames - 1, self.current_frame_idx + self.assistant_annotator.clip_radius)
+            run_center_frame = self.current_frame_idx
         total_clip_frames = clip_end - clip_start + 1
 
         progress_dialog = QProgressDialog("Assistant markup: preparing detection...", None, 0, total_clip_frames, self)
@@ -1061,7 +1162,7 @@ class VideoAnnotationApp(QMainWindow):
                 processor=self.processor,
                 annotations=self.annotations,
                 ball_lookup=self.current_ball_lookup,
-                center_frame=self.current_frame_idx,
+                center_frame=run_center_frame,
                 click_center=(x_norm, y_norm),
                 action_class_id=action_class_id,
                 player_class_id=player_class_id,
@@ -1069,11 +1170,15 @@ class VideoAnnotationApp(QMainWindow):
                 replace_existing=True,
                 progress_callback=update_progress,
                 status_callback=update_status,
+                seed_boxes=seed_boxes,
+                seed_frame=self.mixformer_seed_frame_idx,
             )
-            progress_dialog.setValue(total_clip_frames)
+            progress_dialog.setValue(progress_dialog.maximum())
         finally:
             QApplication.restoreOverrideCursor()
             progress_dialog.close()
+            if self.assistant_annotator.detector_backend == "mixformer_v2_onnx":
+                self._clear_mixformer_seed_selection()
 
         if not result.get("ok"):
             message = result.get("message") or "Failed to build clip annotation."
@@ -1091,6 +1196,96 @@ class VideoAnnotationApp(QMainWindow):
             f"Assistant clip {result['start_frame']}-{result['end_frame']} for {action_type} via Shift+Click: "
             f"{result['boxes_created']} boxes, rally {created_rally}"
         )
+
+    def _clear_mixformer_seed_selection(self):
+        """Reset pending MixFormer seed selection."""
+        self.mixformer_target_frame_idx = None
+        self.mixformer_seed_frame_idx = None
+        self.mixformer_ball_seed_box = None
+        self.mixformer_pending_step = None
+
+    def _set_draw_class_by_name(self, class_name: str):
+        """Switch the draw-class selector to the requested class."""
+        combo_index = self.class_combo.findText(class_name)
+        if combo_index >= 0 and combo_index != self.class_combo.currentIndex():
+            self.class_combo.setCurrentIndex(combo_index)
+
+    def _capture_mixformer_seed_box(self, target_class_name: str, x_norm: float, y_norm: float) -> Optional[tuple[float, float, float, float]]:
+        """Pick the clicked box, force its class, and return its normalized geometry."""
+        picked = self._find_any_seed_box_for_click(x_norm, y_norm)
+        if picked is None:
+            return None
+
+        box_id, _, box_x, box_y, box_w, box_h = picked
+        target_class_id = next(
+            (
+                candidate_id
+                for candidate_id, candidate_name in self.annot_config.box_classes.items()
+                if candidate_name == target_class_name
+            ),
+            None,
+        )
+        if target_class_id is None:
+            return None
+
+        self.annotations.update_box_class(self.current_frame_idx, box_id, int(target_class_id))
+        self._refresh_annotation_views()
+        self.update_display()
+        self._save_project_state()
+        return (box_x, box_y, box_w, box_h)
+
+    def _find_any_seed_box_for_click(
+        self,
+        x_norm: float,
+        y_norm: float,
+    ) -> Optional[tuple[int, int, float, float, float, float]]:
+        """Pick the nearest box on the current frame, preferring boxes under the click."""
+        frame_boxes = self.annotations.yolo_boxes.get(self.current_frame_idx, {})
+        candidates = []
+        for box_id, box_data in frame_boxes.items():
+            box_class_id, box_x, box_y, box_w, box_h = box_data
+            x1 = box_x - box_w / 2.0
+            y1 = box_y - box_h / 2.0
+            x2 = box_x + box_w / 2.0
+            y2 = box_y + box_h / 2.0
+            contains_click = x1 <= x_norm <= x2 and y1 <= y_norm <= y2
+            distance = (box_x - x_norm) ** 2 + (box_y - y_norm) ** 2
+            candidates.append((0 if contains_click else 1, distance, (box_id, int(box_class_id), box_x, box_y, box_w, box_h)))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return candidates[0][2]
+
+    def _find_seed_box_for_click(self, class_name: str, x_norm: float, y_norm: float) -> Optional[tuple[float, float, float, float]]:
+        """Pick the clicked manual seed box for MixFormer initialization."""
+        class_id = next(
+            (candidate_id for candidate_id, candidate_name in self.annot_config.box_classes.items() if candidate_name == class_name),
+            None,
+        )
+        if class_id is None:
+            return None
+
+        frame_boxes = self.annotations.yolo_boxes.get(self.current_frame_idx, {})
+        candidates = []
+        for _, box_data in frame_boxes.items():
+            box_class_id, box_x, box_y, box_w, box_h = box_data
+            if int(box_class_id) != int(class_id):
+                continue
+            x1 = box_x - box_w / 2.0
+            y1 = box_y - box_h / 2.0
+            x2 = box_x + box_w / 2.0
+            y2 = box_y + box_h / 2.0
+            contains_click = x1 <= x_norm <= x2 and y1 <= y_norm <= y2
+            distance = (box_x - x_norm) ** 2 + (box_y - y_norm) ** 2
+            candidates.append((0 if contains_click else 1, distance, (box_x, box_y, box_w, box_h)))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return candidates[0][2]
         
     def copy_boxes(self):
         """Copy all boxes from current frame to clipboard (Ctrl+C)."""

@@ -54,6 +54,30 @@ class FrameAwareStubAssistantAnnotator(AssistantAnnotator):
         return [item for item in detections if item.confidence >= threshold]
 
 
+class StubMixFormerAssistantAnnotator(AssistantAnnotator):
+    def __init__(self, player_tracks, ball_tracks, **kwargs):
+        super().__init__(detector_backend="mixformer_v2_onnx", **kwargs)
+        self._player_tracks = dict(player_tracks)
+        self._ball_tracks = dict(ball_tracks)
+
+    def _track_mixformer_object(
+        self,
+        processor,
+        start_frame,
+        end_frame,
+        init_bbox,
+        progress_offset,
+        progress_total,
+        progress_callback,
+        status_callback,
+        label,
+    ):
+        del processor, start_frame, end_frame, init_bbox, progress_offset, progress_total, progress_callback, status_callback
+        if label == "player":
+            return dict(self._player_tracks)
+        return dict(self._ball_tracks)
+
+
 def test_assistant_annotator_creates_nine_frame_clip_and_rally():
     manager = AnnotationManager({0: "Serve", 2: "Set", 5: "player", 6: "ball"})
     annotator = StubAssistantAnnotator(
@@ -269,3 +293,104 @@ def test_action_box_covers_player_and_ball_only_on_center_triplet():
         assert a_y1 <= min(p_y1, b_y1) + 1e-6
         assert a_x2 >= max(p_x2, b_x2) - 1e-6
         assert a_y2 >= max(p_y2, b_y2) - 1e-6
+
+
+def test_mixformer_requires_seed_boxes():
+    manager = AnnotationManager({0: "Serve", 2: "Set", 5: "player", 6: "ball"})
+    processor = DummyProcessor(total_frames=20)
+    annotator = StubMixFormerAssistantAnnotator(player_tracks={}, ball_tracks={})
+
+    result = annotator.annotate_clip(
+        processor=processor,
+        annotations=manager,
+        ball_lookup={},
+        center_frame=10,
+        click_center=(0.5, 0.5),
+        action_class_id=2,
+        player_class_id=5,
+        ball_class_id=6,
+        seed_boxes=None,
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "missing_seed_boxes"
+
+
+def test_mixformer_creates_action_box_using_neighbor_ball_frames():
+    manager = AnnotationManager({0: "Serve", 2: "Set", 5: "player", 6: "ball"})
+    processor = DummyProcessor(total_frames=20)
+    frame_width = processor.width
+    frame_height = processor.height
+
+    player_tracks = {
+        6: (900.0, 300.0, 120.0, 540.0),
+        7: (915.0, 305.0, 120.0, 540.0),
+        8: (930.0, 310.0, 120.0, 540.0),
+        9: (945.0, 315.0, 120.0, 540.0),
+        10: (960.0, 320.0, 120.0, 540.0),
+        11: (975.0, 325.0, 120.0, 540.0),
+        12: (990.0, 330.0, 120.0, 540.0),
+        13: (1005.0, 335.0, 120.0, 540.0),
+        14: (1020.0, 340.0, 120.0, 540.0),
+    }
+    ball_tracks = {
+        6: (960.0, 500.0, 12.0, 12.0),
+        7: (990.0, 510.0, 12.0, 12.0),
+        8: (1020.0, 520.0, 12.0, 12.0),
+        9: (1050.0, 530.0, 12.0, 12.0),
+        10: (1080.0, 540.0, 12.0, 12.0),
+        11: (1110.0, 550.0, 12.0, 12.0),
+        12: (1140.0, 560.0, 12.0, 12.0),
+        13: (1170.0, 570.0, 12.0, 12.0),
+        14: (1200.0, 580.0, 12.0, 12.0),
+    }
+    annotator = StubMixFormerAssistantAnnotator(player_tracks=player_tracks, ball_tracks=ball_tracks)
+
+    result = annotator.annotate_clip(
+        processor=processor,
+        annotations=manager,
+        ball_lookup={},
+        center_frame=10,
+        click_center=(0.5, 0.5),
+        action_class_id=2,
+        player_class_id=5,
+        ball_class_id=6,
+        seed_boxes={
+            "player": (0.5, 0.5, 0.1, 0.5),
+            "ball": (0.56, 0.5, 0.02, 0.02),
+        },
+        seed_frame=6,
+    )
+
+    assert result["ok"] is True
+    assert result["frames"] == 9
+    assert result["boxes_created"] == 21
+    assert len(result["ball_points"]) == 9
+
+    frame_boxes = list(manager.yolo_boxes[10].values())
+    player_box = next(box for box in frame_boxes if int(box[0]) == 5)
+    action_box = next(box for box in frame_boxes if int(box[0]) == 2)
+
+    def bounds(box):
+        _, x, y, w, h = box
+        return (x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0)
+
+    p_x1, p_y1, p_x2, p_y2 = bounds(player_box)
+    a_x1, a_y1, a_x2, a_y2 = bounds(action_box)
+
+    neighbor_boxes = [
+        AssistantAnnotator._xywh_to_normalized_box(6, ball_tracks[frame_idx], frame_width, frame_height)
+        for frame_idx in range(9, 12)
+    ] + [
+        AssistantAnnotator._xywh_to_normalized_box(5, player_tracks[frame_idx], frame_width, frame_height)
+        for frame_idx in range(9, 12)
+    ]
+    neighbor_x1 = min(box[1] - box[3] / 2.0 for box in neighbor_boxes)
+    neighbor_y1 = min(box[2] - box[4] / 2.0 for box in neighbor_boxes)
+    neighbor_x2 = max(box[1] + box[3] / 2.0 for box in neighbor_boxes)
+    neighbor_y2 = max(box[2] + box[4] / 2.0 for box in neighbor_boxes)
+
+    assert a_x1 <= min(p_x1, neighbor_x1) + 1e-6
+    assert a_y1 <= min(p_y1, neighbor_y1) + 1e-6
+    assert a_x2 >= max(p_x2, neighbor_x2) - 1e-6
+    assert a_y2 >= max(p_y2, neighbor_y2) - 1e-6

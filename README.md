@@ -7,6 +7,17 @@ A desktop tool for annotating volleyball videos with:
 - normal frame and `3-frame` superframe viewing
 - manual ball position markup
 
+## Linux Runtime Notes
+
+On Ubuntu or Debian, Qt's `xcb` platform plugin needs several X11/XCB runtime libraries. Install them before launching the app:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-keysyms1 libxcb-xkb1
+```
+
+The app also forces Qt to use the `PyQt6` plugin directory at startup so `opencv-python` does not redirect Qt to its own incompatible plugin bundle.
+
 ## Interface
 
 ![VAA interface](docs/VAA-annotater-set.jpg)

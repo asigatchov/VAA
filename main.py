@@ -1,10 +1,25 @@
 #!/usr/bin/env python3
 """Main entry point for Volleyball Action Annotator application."""
+import os
 import sys
+from PyQt6.QtCore import QLibraryInfo
 from PyQt6.QtWidgets import QApplication
 from loguru import logger
 
+
+def configure_qt_environment():
+    """Keep Qt pointed at the PyQt6 runtime when cv2 is imported."""
+    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = QLibraryInfo.path(
+        QLibraryInfo.LibraryPath.PluginsPath
+    )
+    os.environ.pop("QT_QPA_FONTDIR", None)
+
+
+configure_qt_environment()
+
 from ui.main_window import VideoAnnotationApp
+
+configure_qt_environment()
 
 
 def setup_logging():
