@@ -18,6 +18,7 @@ class ActionPanel(QWidget):
     action_type_selected = pyqtSignal(str)
     action_reclass_requested = pyqtSignal(int, int, int, str, str)
     rally_deleted = pyqtSignal(int)
+    rally_merge_requested = pyqtSignal(list)
     rally_selected = pyqtSignal(int)
     seek_to_rally = pyqtSignal(int)
     playback_step_changed = pyqtSignal(int)
@@ -33,6 +34,8 @@ class ActionPanel(QWidget):
         self.current_frame = 0
         self.focus_rally_id: int | None = None
         self.selected_action_item: Dict | None = None
+        self.checked_rally_ids: set[int] = set()
+        self._refreshing_tree = False
 
         self.setup_ui()
 
@@ -153,6 +156,11 @@ class ActionPanel(QWidget):
         self.delete_btn.setEnabled(False)
         self.delete_btn.clicked.connect(self._delete_selected_rally)
         list_header.addWidget(self.delete_btn)
+
+        self.merge_btn = QPushButton("Merge Selected")
+        self.merge_btn.setEnabled(False)
+        self.merge_btn.clicked.connect(self._merge_checked_rallies)
+        list_header.addWidget(self.merge_btn)
         layout.addLayout(list_header)
 
         self.rally_tree = QTreeWidget()
@@ -183,6 +191,7 @@ class ActionPanel(QWidget):
             "}"
         )
         self.rally_tree.itemClicked.connect(self._on_item_clicked)
+        self.rally_tree.itemChanged.connect(self._on_item_changed)
         self.rally_tree.currentItemChanged.connect(self._on_current_item_changed)
         self.rally_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.rally_tree.customContextMenuRequested.connect(self._show_tree_context_menu)
@@ -231,6 +240,10 @@ class ActionPanel(QWidget):
         self._update_action_buttons()
         self.action_type_selected.emit(action_type)
 
+    def select_action_type(self, action_type: str):
+        """Public wrapper for changing the selected action step."""
+        self._select_action_type(action_type)
+
     def _update_action_buttons(self):
         for action_type, button in self.action_buttons.items():
             is_selected = action_type == self.selected_action_type
@@ -268,6 +281,9 @@ class ActionPanel(QWidget):
 
     def _refresh_list(self):
         current_rally_id = self._selected_rally_id()
+        valid_rally_ids = {int(rally.get("id", -1)) for rally in self.rallies}
+        self.checked_rally_ids.intersection_update(valid_rally_ids)
+        self._refreshing_tree = True
         self.rally_tree.clear()
         self.selected_action_item = None
 
@@ -294,6 +310,12 @@ class ActionPanel(QWidget):
             item.setData(0, Qt.ItemDataRole.UserRole + 2, start_frame)
             item.setData(0, Qt.ItemDataRole.UserRole + 3, bool(not rally.get("is_pending")))
             item.setToolTip(0, f"Frames {start_frame}-{end_frame}")
+            if not rally.get("is_pending"):
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(
+                    0,
+                    Qt.CheckState.Checked if int(rally["id"]) in self.checked_rally_ids else Qt.CheckState.Unchecked
+                )
             self._style_tree_item(item, "pending_rally" if rally.get("is_pending") else "rally")
             self.rally_tree.addTopLevelItem(item)
             if rally.get("is_pending"):
@@ -334,11 +356,13 @@ class ActionPanel(QWidget):
         selected_item = self.rally_tree.currentItem()
         can_delete = bool(selected_item and selected_item.data(0, Qt.ItemDataRole.UserRole + 3))
         self.delete_btn.setEnabled(can_delete)
+        self._update_merge_button()
         self._sync_action_editor(selected_item)
         open_count = 1 if self.pending_rally is not None else 0
         self.stats_label.setText(
             f"Total Rallies: {len(self.rallies)} | Annotated: {annotated_rallies} | Open: {open_count}"
         )
+        self._refreshing_tree = False
 
     def _selected_rally_id(self) -> int:
         item = self.rally_tree.currentItem()
@@ -351,6 +375,7 @@ class ActionPanel(QWidget):
         rally_id = self._selected_rally_id()
         can_delete = bool(current and current.data(0, Qt.ItemDataRole.UserRole + 3))
         self.delete_btn.setEnabled(can_delete)
+        self._update_merge_button()
         self._sync_action_editor(current)
         self.rally_selected.emit(rally_id)
 
@@ -367,6 +392,26 @@ class ActionPanel(QWidget):
         if rally_id < 0:
             return
         self.rally_deleted.emit(rally_id)
+
+    def _merge_checked_rallies(self):
+        rally_ids = sorted(self.checked_rally_ids)
+        if len(rally_ids) < 2:
+            return
+        self.rally_merge_requested.emit(rally_ids)
+
+    def _on_item_changed(self, item: QTreeWidgetItem, column: int):
+        del column
+        if self._refreshing_tree or item.parent() is not None:
+            return
+        if not bool(item.data(0, Qt.ItemDataRole.UserRole + 3)):
+            return
+
+        rally_id = int(item.data(0, Qt.ItemDataRole.UserRole))
+        if item.checkState(0) == Qt.CheckState.Checked:
+            self.checked_rally_ids.add(rally_id)
+        else:
+            self.checked_rally_ids.discard(rally_id)
+        self._update_merge_button()
 
     def _show_tree_context_menu(self, pos):
         item = self.rally_tree.itemAt(pos)
@@ -437,6 +482,14 @@ class ActionPanel(QWidget):
         self.segment_hint_label.setVisible(False)
         self.segment_class_combo.setEnabled(False)
         self.apply_segment_btn.setEnabled(False)
+
+    def clear_checked_rallies(self):
+        """Reset merge selection after external rally updates."""
+        self.checked_rally_ids.clear()
+        self._update_merge_button()
+
+    def _update_merge_button(self):
+        self.merge_btn.setEnabled(len(self.checked_rally_ids) >= 2)
 
     def _is_focus_rally(self, rally_id: int) -> bool:
         if self.focus_rally_id is None:

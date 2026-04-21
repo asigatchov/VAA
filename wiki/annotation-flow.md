@@ -34,4 +34,7 @@
 7. `player` and `ball` are written on all 9 frames.
 8. `action` is written only on `center_frame - 1` to `center_frame + 1`.
 9. `action` box is built as the union of `player` and `ball`.
-10. Rally/timeline state is refreshed and the project is saved.
+10. Assistant clip markup does not auto-complete a rally.
+11. If the assistant marks `Serve` and no rally is pending yet, UI starts a pending rally from that clip start.
+12. After `Serve`, the selected action advances to `Receive`.
+13. Rally/timeline state is refreshed and the project is saved.

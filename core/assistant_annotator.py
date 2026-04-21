@@ -228,7 +228,7 @@ class AssistantAnnotator:
 
     clip_radius: int = 4
     crop_size_px: Tuple[int, int] = (960, 540)
-    crop_mode: str = "crop"
+    crop_mode: str = "full_frame"
     detector_backend: str = "rfdetr_medium"
     model_variant: str = "medium"
     resolution: int = 640
@@ -440,7 +440,6 @@ class AssistantAnnotator:
         if progress_callback is not None:
             progress_callback(len(frame_indices), len(frame_indices), end_frame)
 
-        created_rally = self._ensure_clip_rally(annotations, processor, start_frame, end_frame)
         return {
             "ok": True,
             "start_frame": start_frame,
@@ -448,7 +447,7 @@ class AssistantAnnotator:
             "frames": end_frame - start_frame + 1,
             "boxes_created": created_boxes,
             "ball_points": ball_points,
-            "created_rally": created_rally,
+            "created_rally": False,
             "model_variant": self.model_variant,
             "detector_backend": self.detector_backend,
         }
@@ -564,7 +563,6 @@ class AssistantAnnotator:
         if progress_callback is not None:
             progress_callback(total_steps, total_steps, end_frame)
 
-        created_rally = self._ensure_clip_rally(annotations, processor, start_frame, end_frame)
         return {
             "ok": True,
             "start_frame": start_frame,
@@ -572,7 +570,7 @@ class AssistantAnnotator:
             "frames": end_frame - start_frame + 1,
             "boxes_created": created_boxes,
             "ball_points": ball_points,
-            "created_rally": created_rally,
+            "created_rally": False,
             "model_variant": self.model_variant,
             "detector_backend": self.detector_backend,
         }
@@ -841,19 +839,6 @@ class AssistantAnnotator:
         if not candidates:
             return None
         return max(candidates, key=lambda item: item.confidence)
-
-    def _ensure_clip_rally(self, annotations: AnnotationManager, processor, start_frame: int, end_frame: int) -> bool:
-        """Create one rally covering the clip unless one already exists."""
-        for rally in annotations.rallies:
-            if int(rally.get("start_frame", -1)) == start_frame and int(rally.get("end_frame", -1)) == end_frame:
-                return False
-            if int(rally.get("start_frame", -1)) <= start_frame and int(rally.get("end_frame", -1)) >= end_frame:
-                return False
-
-        started = annotations.start_rally(start_frame, getattr(processor, "fps", 30.0))
-        if not started:
-            return False
-        return annotations.end_rally(end_frame) is not None
 
     @staticmethod
     def _size_from_xyxy(

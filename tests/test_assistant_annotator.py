@@ -78,7 +78,7 @@ class StubMixFormerAssistantAnnotator(AssistantAnnotator):
         return dict(self._ball_tracks)
 
 
-def test_assistant_annotator_creates_nine_frame_clip_and_rally():
+def test_assistant_annotator_creates_nine_frame_clip_without_creating_rally():
     manager = AnnotationManager({0: "Serve", 2: "Set", 5: "player", 6: "ball"})
     annotator = StubAssistantAnnotator(
         detections=[
@@ -105,12 +105,10 @@ def test_assistant_annotator_creates_nine_frame_clip_and_rally():
     assert result["frames"] == 9
     assert result["boxes_created"] == 21
     assert len(result["ball_points"]) == 9
+    assert result["created_rally"] is False
     assert result["model_variant"] == "medium"
-    assert len(manager.rallies) == 1
-    assert manager.rallies[0]["start_frame"] == 6
-    assert manager.rallies[0]["end_frame"] == 14
-    assert len(manager.actions) == 1
-    assert manager.actions[0]["type"] == "Set"
+    assert manager.rallies == []
+    assert manager.actions == []
 
     for frame_idx in range(6, 15):
         frame_boxes = manager.yolo_boxes[frame_idx]
@@ -152,7 +150,7 @@ def test_assistant_annotator_replaces_existing_clip_classes_without_duplicates()
         ball_class_id=6,
     )
 
-    assert len(manager.rallies) == 1
+    assert len(manager.rallies) == 0
     for frame_idx in range(6, 15):
         frame_boxes = manager.yolo_boxes[frame_idx]
         classes = sorted(int(box_data[0]) for box_data in frame_boxes.values())
@@ -241,6 +239,39 @@ def test_assistant_uses_highest_confidence_ball_on_each_frame():
         assert abs(y_center - expected_y) < 1e-6
         assert abs(width - expected_w) < 1e-6
         assert abs(height - expected_h) < 1e-6
+
+
+def test_assistant_annotator_rebuilds_actions_inside_existing_manual_rally():
+    manager = AnnotationManager({0: "Serve", 2: "Set", 5: "player", 6: "ball"})
+    annotator = StubAssistantAnnotator(
+        detections=[
+            Detection("person", 0.95, (900.0, 300.0, 1020.0, 840.0)),
+            Detection("sports ball", 0.71, (1048.0, 516.0, 1064.0, 532.0)),
+        ]
+    )
+    processor = DummyProcessor(total_frames=20)
+
+    assert manager.start_rally(6, fps=processor.fps) is True
+    result = annotator.annotate_clip(
+        processor=processor,
+        annotations=manager,
+        ball_lookup={},
+        center_frame=10,
+        click_center=(0.5, 0.5),
+        action_class_id=2,
+        player_class_id=5,
+        ball_class_id=6,
+    )
+    rally = manager.end_rally(14)
+
+    assert result["ok"] is True
+    assert result["created_rally"] is False
+    assert rally is not None
+    assert len(manager.rallies) == 1
+    assert manager.rallies[0]["start_frame"] == 6
+    assert manager.rallies[0]["end_frame"] == 14
+    assert len(manager.actions) == 1
+    assert manager.actions[0]["type"] == "Set"
 
 
 def test_action_box_covers_player_and_ball_only_on_center_triplet():

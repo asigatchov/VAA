@@ -19,8 +19,10 @@ Current behavior:
 9. `player` and `ball` boxes are created on all 9 frames.
 10. `action` box is created only on the center 3 frames: `center_frame - 1` to `center_frame + 1`.
 11. `action` box is the union of `player` and `ball` boxes on those 3 frames.
-12. A rally covering the clip is created or reused.
-13. State is saved through `AnnotationManager` and project JSON.
+12. Assistant markup does not create or restart a rally by itself.
+13. Rally flow is controlled manually with the buttons, or a new pending rally may start from a `Serve` clip in the UI.
+14. After `Serve` assistant markup, the UI advances the selected action to `Receive`.
+15. State is saved through `AnnotationManager` and project JSON.
 
 Notes:
 

@@ -238,6 +238,36 @@ class TestRallyLifecycle:
         assert manager.current_rally_start is None
         assert manager.cancel_rally() is False
 
+    def test_merge_rallies_creates_one_covering_range(self):
+        manager = AnnotationManager({
+            0: "Serve",
+            1: "Receive",
+            2: "Set",
+            3: "Attack",
+        })
+
+        assert manager.start_rally(10, fps=25.0) is True
+        manager.add_yolo_box(12, (0, 0.1, 0.1, 0.1, 0.1))
+        assert manager.end_rally(20) is not None
+
+        assert manager.start_rally(30, fps=25.0) is True
+        manager.add_yolo_box(32, (1, 0.1, 0.1, 0.1, 0.1))
+        assert manager.end_rally(40) is not None
+
+        merged = manager.merge_rallies([1, 2])
+
+        assert merged is not None
+        assert len(manager.rallies) == 1
+        assert manager.rallies[0]["id"] == merged["id"]
+        assert manager.rallies[0]["start_frame"] == 10
+        assert manager.rallies[0]["end_frame"] == 40
+        assert [action["type"] for action in manager.rallies[0]["actions"]] == ["Serve", "Receive"]
+
+    def test_merge_rallies_requires_two_existing_rallies(self):
+        manager = AnnotationManager()
+
+        assert manager.merge_rallies([1]) is None
+
     def test_clear_boxes_in_range(self):
         manager = AnnotationManager()
 

@@ -8,7 +8,7 @@ import cv2
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QFileDialog, QMessageBox, QLabel, QPushButton, QCheckBox,
-    QStatusBar, QComboBox, QApplication, QProgressDialog, QSpinBox
+    QStatusBar, QComboBox, QApplication, QSpinBox
 )
 from PyQt6.QtCore import QTimer, Qt, pyqtSlot
 from PyQt6.QtGui import QAction, QKeySequence, QImage, QPixmap
@@ -213,6 +213,7 @@ class VideoAnnotationApp(QMainWindow):
         self.action_panel.action_type_selected.connect(self.on_action_type_selected)
         self.action_panel.action_reclass_requested.connect(self.on_action_reclass_requested)
         self.action_panel.rally_deleted.connect(self.delete_rally)
+        self.action_panel.rally_merge_requested.connect(self.merge_rallies)
         self.action_panel.rally_selected.connect(self.on_rally_selected)
         self.action_panel.seek_to_rally.connect(self.seek)
         self.action_panel.playback_step_changed.connect(self.on_playback_step_changed)
@@ -237,6 +238,7 @@ class VideoAnnotationApp(QMainWindow):
         self.assistant_crop_combo = QComboBox()
         self.assistant_crop_combo.addItem("Far Plan: Crop", "crop")
         self.assistant_crop_combo.addItem("Front Plan: Full Frame", "full_frame")
+        self.assistant_crop_combo.setCurrentIndex(1)
         self.assistant_crop_combo.currentIndexChanged.connect(self.on_assistant_crop_changed)
         right_panel.addWidget(self.assistant_crop_combo)
 
@@ -909,6 +911,51 @@ class VideoAnnotationApp(QMainWindow):
                 "Split Rally",
                 "Current frame must be inside an existing rally, not at its boundary."
             )
+
+    def merge_rallies(self, rally_ids: list[int]):
+        """Merge selected rallies into one wider rally."""
+        selected_rallies = [
+            rally for rally in self.annotations.rallies
+            if int(rally.get("id", -1)) in {int(rally_id) for rally_id in rally_ids}
+        ]
+        if len(selected_rallies) < 2:
+            QMessageBox.information(self, "Merge Rallies", "Select at least two saved rallies.")
+            return
+
+        selected_rallies.sort(
+            key=lambda rally: (
+                int(rally.get("start_frame", 0)),
+                int(rally.get("end_frame", 0)),
+                int(rally.get("id", 0)),
+            )
+        )
+        start_frame = int(selected_rallies[0].get("start_frame", 0))
+        end_frame = int(selected_rallies[-1].get("end_frame", start_frame))
+        reply = QMessageBox.question(
+            self,
+            "Merge Rallies",
+            (
+                f"Merge {len(selected_rallies)} rallies into one range {start_frame}-{end_frame}?\n\n"
+                "Existing box markup will be kept. Derived actions will be rebuilt for the merged rally."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        merged_rally = self.annotations.merge_rallies(rally_ids)
+        if merged_rally is None:
+            QMessageBox.warning(self, "Merge Rallies", "Failed to merge the selected rallies.")
+            return
+
+        self.action_panel.clear_checked_rallies()
+        self.selected_rally_id = int(merged_rally.get("id", -1))
+        self._refresh_annotation_views()
+        self._save_project_state()
+        self.update_display()
+        self.status_bar.showMessage(
+            f"Merged rallies into {merged_rally['start_frame']}-{merged_rally['end_frame']}"
+        )
     
     
     def on_box_added(self, box):
@@ -1040,10 +1087,8 @@ class VideoAnnotationApp(QMainWindow):
         )
 
         if action_class_id is None or player_class_id is None or ball_class_id is None:
-            QMessageBox.warning(
-                self,
-                "Assistant Markup",
-                "Required classes are missing. Expected action type, 'player', and 'ball' classes."
+            self.status_bar.showMessage(
+                "Assistant markup failed: required action, player, or ball classes are missing."
             )
             return
 
@@ -1056,52 +1101,42 @@ class VideoAnnotationApp(QMainWindow):
                 self.mixformer_ball_seed_box = None
                 self._set_draw_class_by_name("ball")
                 self.seek(self.mixformer_seed_frame_idx)
-                QMessageBox.information(
-                    self,
-                    "MixFormerV2",
+                self.status_bar.showMessage(
                     (
-                        f"Клип будет построен от кадра {self.mixformer_seed_frame_idx} до "
-                        f"{self.mixformer_seed_frame_idx + self.assistant_annotator.clip_radius * 2}.\n\n"
-                        "Шаг 1: выделите box мяча на текущем кадре через Shift+Click."
-                    ),
+                        f"MixFormerV2: clip {self.mixformer_seed_frame_idx}-"
+                        f"{self.mixformer_seed_frame_idx + self.assistant_annotator.clip_radius * 2}, "
+                        "step 1/2: select ball box with Shift+Click."
+                    )
                 )
                 return
 
             if self.mixformer_seed_frame_idx != self.current_frame_idx:
                 self._clear_mixformer_seed_selection()
-                QMessageBox.warning(
-                    self,
-                    "MixFormerV2",
-                    "Для подтверждения seed-боксов вернитесь на стартовый кадр клипа и повторите шаги ball -> player."
+                self.status_bar.showMessage(
+                    "MixFormerV2: return to the clip start frame and repeat ball -> player seed selection."
                 )
                 return
 
             if self.mixformer_pending_step == "ball":
                 ball_seed = self._capture_mixformer_seed_box("ball", x_norm, y_norm)
                 if ball_seed is None:
-                    QMessageBox.warning(
-                        self,
-                        "MixFormerV2",
-                        "Шаг 1: сначала нарисуйте или выберите box мяча, затем Shift+Click по нему."
+                    self.status_bar.showMessage(
+                        "MixFormerV2: step 1/2 failed, draw or select the ball box first."
                     )
                     return
                 self.mixformer_seed_frame_idx = self.current_frame_idx
                 self.mixformer_ball_seed_box = ball_seed
                 self.mixformer_pending_step = "player"
                 self._set_draw_class_by_name("player")
-                QMessageBox.information(
-                    self,
-                    "MixFormerV2",
-                    "Шаг 2: выделите box игрока на этом же кадре через Shift+Click."
+                self.status_bar.showMessage(
+                    "MixFormerV2: step 2/2, select player box with Shift+Click."
                 )
                 return
 
             player_seed = self._capture_mixformer_seed_box("player", x_norm, y_norm)
             if player_seed is None:
-                QMessageBox.warning(
-                    self,
-                    "MixFormerV2",
-                    "Шаг 2: сначала нарисуйте или выберите box игрока, затем Shift+Click по нему."
+                self.status_bar.showMessage(
+                    "MixFormerV2: step 2/2 failed, draw or select the player box first."
                 )
                 return
 
@@ -1110,7 +1145,7 @@ class VideoAnnotationApp(QMainWindow):
                 "player": player_seed,
             }
             if self.mixformer_target_frame_idx is None or self.mixformer_seed_frame_idx is None:
-                QMessageBox.warning(self, "MixFormerV2", "Сброшено состояние seed-выбора. Повторите шаги заново.")
+                self.status_bar.showMessage("MixFormerV2: seed selection was reset, repeat the steps.")
                 self._clear_mixformer_seed_selection()
                 return
 
@@ -1128,31 +1163,12 @@ class VideoAnnotationApp(QMainWindow):
             clip_start = max(0, self.current_frame_idx - self.assistant_annotator.clip_radius)
             clip_end = min(self.processor.total_frames - 1, self.current_frame_idx + self.assistant_annotator.clip_radius)
             run_center_frame = self.current_frame_idx
-        total_clip_frames = clip_end - clip_start + 1
-
-        progress_dialog = QProgressDialog("Assistant markup: preparing detection...", None, 0, total_clip_frames, self)
-        progress_dialog.setWindowTitle("Assistant Markup")
-        progress_dialog.setMinimumDuration(0)
-        progress_dialog.setAutoClose(True)
-        progress_dialog.setAutoReset(True)
-        progress_dialog.setCancelButton(None)
-        progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
-        progress_dialog.setValue(0)
-        progress_dialog.show()
-        QApplication.processEvents()
-
         def update_progress(done: int, total: int, frame_idx: int):
             total = max(1, int(total))
-            progress_dialog.setMaximum(total)
-            progress_dialog.setLabelText(f"Assistant markup: detecting frame {min(done + 1, total)}/{total} (frame {frame_idx})")
-            progress_dialog.setValue(min(done, total))
             self.status_bar.showMessage(f"Assistant markup running: {min(done + 1, total)}/{total} frames")
             QApplication.processEvents()
 
         def update_status(message: str):
-            progress_dialog.setMaximum(total_clip_frames)
-            progress_dialog.setLabelText(message)
-            progress_dialog.setValue(0)
             self.status_bar.showMessage(message)
             QApplication.processEvents()
 
@@ -1173,29 +1189,56 @@ class VideoAnnotationApp(QMainWindow):
                 seed_boxes=seed_boxes,
                 seed_frame=self.mixformer_seed_frame_idx,
             )
-            progress_dialog.setValue(progress_dialog.maximum())
         finally:
             QApplication.restoreOverrideCursor()
-            progress_dialog.close()
             if self.assistant_annotator.detector_backend == "mixformer_v2_onnx":
                 self._clear_mixformer_seed_selection()
 
         if not result.get("ok"):
             message = result.get("message") or "Failed to build clip annotation."
-            QMessageBox.warning(self, "Assistant Markup", message)
+            self.status_bar.showMessage(f"Assistant markup failed: {message}")
             return
 
         for frame_idx, coords in result.get("ball_points", {}).items():
             self._upsert_ball_point(int(frame_idx), int(coords[0]), int(coords[1]))
 
+        rally_started = self._maybe_start_rally_from_assistant_clip(action_type, result)
+        self._advance_action_flow_after_markup(action_type)
         self._refresh_annotation_views()
         self._save_project_state()
         self.update_display()
-        created_rally = "created" if result.get("created_rally") else "reused"
+        rally_state = "started" if rally_started else "unchanged"
         self.status_bar.showMessage(
             f"Assistant clip {result['start_frame']}-{result['end_frame']} for {action_type} via Shift+Click: "
-            f"{result['boxes_created']} boxes, rally {created_rally}"
+            f"{result['boxes_created']} boxes, rally {rally_state}"
         )
+
+    def _maybe_start_rally_from_assistant_clip(self, action_type: str, result: dict) -> bool:
+        """Start a pending rally from a Serve clip when no rally is active yet."""
+        if not self.processor or action_type != "Serve":
+            return False
+        if self.annotations.current_rally_start is not None:
+            return False
+
+        clip_start = int(result.get("start_frame", self.current_frame_idx))
+        for rally in self.annotations.rallies:
+            if int(rally.get("start_frame", -1)) <= clip_start <= int(rally.get("end_frame", -1)):
+                return False
+
+        return self.annotations.start_rally(clip_start, self.processor.fps)
+
+    def _advance_action_flow_after_markup(self, action_type: str):
+        """Move action selection to the next configured rally step."""
+        try:
+            current_index = self.annot_config.action_types.index(action_type)
+        except ValueError:
+            return
+
+        next_index = current_index + 1
+        if next_index >= len(self.annot_config.action_types):
+            return
+
+        self.action_panel.select_action_type(self.annot_config.action_types[next_index])
 
     def _clear_mixformer_seed_selection(self):
         """Reset pending MixFormer seed selection."""

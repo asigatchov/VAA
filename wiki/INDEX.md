@@ -16,6 +16,9 @@
 - UI select: `Auto-Label Model`
 - Crop select: `Assistant Crop`
 - Supported assistant backend: `RF-DETR Medium`
+- `MixFormerV2 ONNX` assistant markup does not auto-restart `rally`
+- `rally` starts from the button or from `Serve`
+- after assistant markup of `Serve`, UI switches to `Receive`
 - Supported assistant crop modes:
   - `Far Plan: Crop`
   - `Front Plan: Full Frame`

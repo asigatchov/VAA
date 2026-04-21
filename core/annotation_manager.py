@@ -138,6 +138,72 @@ class AnnotationManager:
         logger.warning(f"No rally found to split at frame {frame_idx}")
         return False
 
+    def merge_rallies(self, rally_ids: List[int]) -> Optional[Dict]:
+        """Merge multiple saved rallies into one covering the full selected range."""
+        unique_ids = []
+        seen_ids = set()
+        for rally_id in rally_ids:
+            rally_id_int = int(rally_id)
+            if rally_id_int in seen_ids:
+                continue
+            seen_ids.add(rally_id_int)
+            unique_ids.append(rally_id_int)
+
+        if len(unique_ids) < 2:
+            logger.warning("Need at least two rallies to merge")
+            return None
+
+        selected_rallies = [
+            rally for rally in self.rallies
+            if int(rally.get("id", -1)) in seen_ids
+        ]
+        if len(selected_rallies) != len(unique_ids):
+            logger.warning(f"Some rallies were not found for merge: {unique_ids}")
+            return None
+
+        selected_rallies.sort(
+            key=lambda rally: (
+                int(rally.get("start_frame", 0)),
+                int(rally.get("end_frame", 0)),
+                int(rally.get("id", 0)),
+            )
+        )
+        start_frame = int(selected_rallies[0]["start_frame"])
+        end_frame = max(int(rally.get("end_frame", start_frame)) for rally in selected_rallies)
+        fps = self._fps_for_item(selected_rallies[0])
+
+        remaining_rallies = [
+            rally for rally in self.rallies
+            if int(rally.get("id", -1)) not in seen_ids
+        ]
+        merged_rally = {
+            "id": self.next_rally_id,
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "type": "Rally",
+            "start_time": start_frame / fps,
+            "end_time": end_frame / fps,
+            "created_at": datetime.now().isoformat(),
+            "actions": [],
+            "hierarchy": [],
+        }
+        self.next_rally_id += 1
+        remaining_rallies.append(merged_rally)
+        remaining_rallies.sort(
+            key=lambda rally: (
+                int(rally.get("start_frame", 0)),
+                int(rally.get("end_frame", 0)),
+                int(rally.get("id", 0)),
+            )
+        )
+        self.rallies = remaining_rallies
+        self._rebuild_actions()
+        logger.info(
+            f"Merged rallies {unique_ids} into rally {merged_rally['id']}: "
+            f"{start_frame}-{end_frame}"
+        )
+        return merged_rally
+
     def add_yolo_box(self, frame_idx: int, box: Tuple, validate: bool = True) -> int:
         """Add a YOLO bounding box to a frame."""
         cls_id, x, y, w, h = box[:5]
