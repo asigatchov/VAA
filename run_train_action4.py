@@ -5,10 +5,10 @@ DATASET_PATH = "/home/nssd/gled/vb/dataset-action4/"
 
 DATASET_PATH = "datasets-coco-split/"
 
-MYMODEL_DIR = "./model_action4_nano_20260410_01"
+MYMODEL_DIR = "./model_action4_20260421_02"
 
-# model = RFDETRMedium()
-model = RFDETRNano()
+model = RFDETRMedium()
+#model = RFDETRNano()
 model.train(
     dataset_dir=DATASET_PATH,
     epochs=70,

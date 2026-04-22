@@ -31,6 +31,7 @@ class ImageCanvas(QLabel):
         self.box_colors = {0: QColor("#FF0000"), 1: QColor("#0000FF")}  # Default colors
         self.box_classes = {0: "Class 0", 1: "Class 1"}  # Default class names
         self.selected_color = QColor("#00FF00")  # Green
+        self.confirmed_box_ids: set[int] = set()
         
         # Drawing state
         self.is_drawing = False
@@ -76,6 +77,11 @@ class ImageCanvas(QLabel):
         self.boxes = boxes if boxes is not None else []
         self.ball_position = ball_position
         self.selected_box_idx = None
+        self.update()
+
+    def set_confirmed_box_ids(self, box_ids: set[int]):
+        """Mark boxes confirmed for assistant initialization."""
+        self.confirmed_box_ids = set(box_ids)
         self.update()
     
     def set_box_colors(self, color_dict: dict):
@@ -176,15 +182,22 @@ class ImageCanvas(QLabel):
             box_h = int(h * img_height)
             
             # Select color and line width
+            is_confirmed = box_id is not None and int(box_id) in self.confirmed_box_ids
             if idx == self.selected_box_idx:
                 color = self.selected_color
                 line_width = self.selected_line_width
+                pen_style = Qt.PenStyle.SolidLine
+            elif is_confirmed:
+                color = self.selected_color
+                line_width = self.selected_line_width
+                pen_style = Qt.PenStyle.DashLine
             else:
                 color = self.box_colors.get(cls_id, QColor("#FFFFFF"))
                 line_width = self.box_line_width
+                pen_style = Qt.PenStyle.SolidLine
             
             # Draw rectangle
-            pen = QPen(color, line_width)
+            pen = QPen(color, line_width, pen_style)
             painter.setPen(pen)
             painter.drawRect(box_x, box_y, box_w, box_h)
             if idx == self.selected_box_idx:

@@ -53,6 +53,7 @@ class VideoAnnotationApp(QMainWindow):
         self.mixformer_seed_frame_idx: Optional[int] = None
         self.mixformer_ball_seed_box: Optional[tuple[float, float, float, float]] = None
         self.mixformer_pending_step: Optional[str] = None
+        self.mixformer_confirmed_seed_box_ids: set[int] = set()
         
         # State
         self.current_frame_idx = 0
@@ -730,6 +731,7 @@ class VideoAnnotationApp(QMainWindow):
         
         # Update canvas
         self.canvas.set_image(pixmap, boxes, self._get_current_ball_position_normalized())
+        self.canvas.set_confirmed_box_ids(self._current_mixformer_confirmed_box_ids())
         
         # Update info labels
         self.update_info_labels()
@@ -1140,6 +1142,7 @@ class VideoAnnotationApp(QMainWindow):
                 )
                 return
 
+            QApplication.processEvents()
             seed_boxes = {
                 "ball": self.mixformer_ball_seed_box,
                 "player": player_seed,
@@ -1246,6 +1249,14 @@ class VideoAnnotationApp(QMainWindow):
         self.mixformer_seed_frame_idx = None
         self.mixformer_ball_seed_box = None
         self.mixformer_pending_step = None
+        self.mixformer_confirmed_seed_box_ids.clear()
+        self.canvas.set_confirmed_box_ids(set())
+
+    def _current_mixformer_confirmed_box_ids(self) -> set[int]:
+        """Return confirmed MixFormer seed boxes visible on the current frame."""
+        if self.mixformer_seed_frame_idx != self.current_frame_idx:
+            return set()
+        return set(self.mixformer_confirmed_seed_box_ids)
 
     def _set_draw_class_by_name(self, class_name: str):
         """Switch the draw-class selector to the requested class."""
@@ -1271,7 +1282,10 @@ class VideoAnnotationApp(QMainWindow):
         if target_class_id is None:
             return None
 
-        self.annotations.update_box_class(self.current_frame_idx, box_id, int(target_class_id))
+        if not self.annotations.update_box_class(self.current_frame_idx, box_id, int(target_class_id)):
+            return None
+
+        self.mixformer_confirmed_seed_box_ids.add(int(box_id))
         self._refresh_annotation_views()
         self.update_display()
         self._save_project_state()

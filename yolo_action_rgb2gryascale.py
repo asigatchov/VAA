@@ -48,8 +48,12 @@ def parse_args() -> argparse.Namespace:
             "frame-1, frame, frame+1, while labels come from the current frame only."
         )
     )
-    parser.add_argument("project_path", nargs="?", help="Path to VAA project JSON")
-    parser.add_argument("--project_path", dest="project_path_flag", help="Path to VAA project JSON")
+    parser.add_argument("project_path", nargs="?", help="Path to one VAA project JSON")
+    parser.add_argument("--project_path", dest="project_path_flag", help="Path to one VAA project JSON")
+    parser.add_argument(
+        "--projects_path",
+        help="Path to a directory with VAA project JSON files; all projects are exported",
+    )
     parser.add_argument("--data_dir", default="datasets-yolo", help="Output dataset directory")
     parser.add_argument(
         "--no-progress",
@@ -66,14 +70,47 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     args.project_path = args.project_path_flag or args.project_path
-    if not args.project_path:
-        parser.error("project_path is required")
+    if bool(args.project_path) == bool(args.projects_path):
+        parser.error("provide exactly one of project_path/--project_path or --projects_path")
     return args
 
 
 def read_project(project_path: Path) -> dict:
     with open(project_path, "r", encoding="utf-8") as file_obj:
         return json.load(file_obj)
+
+
+def discover_project_paths(projects_path: Path) -> list[Path]:
+    """Find VAA project JSON files inside a directory."""
+    if not projects_path.exists():
+        raise FileNotFoundError(f"Projects directory not found: {projects_path}")
+    if not projects_path.is_dir():
+        raise NotADirectoryError(f"--projects_path must be a directory: {projects_path}")
+
+    project_paths = [
+        path
+        for path in projects_path.rglob("*.json")
+        if path.name != "dataset_manifest.json" and not any(part in {"images", "labels"} for part in path.parts)
+    ]
+    return sorted(project_paths)
+
+
+def resolve_single_project_path(project_path: Path) -> Path:
+    """Resolve a single project path, accepting either a JSON file or a project directory."""
+    if not project_path.exists():
+        raise FileNotFoundError(f"Project JSON not found: {project_path}")
+    if project_path.is_file():
+        return project_path
+
+    candidates = sorted(path for path in project_path.glob("*.json") if path.name != "dataset_manifest.json")
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise FileNotFoundError(f"No project JSON found in directory: {project_path}")
+    raise ValueError(
+        f"Multiple project JSON files found in {project_path}; pass one with --project_path: "
+        + ", ".join(str(path) for path in candidates)
+    )
 
 
 def ensure_dir(path: Path) -> None:
@@ -369,14 +406,8 @@ def build_export_plan(yolo_boxes: dict, total_frames: int) -> list[tuple[int, di
     return sorted(export_frames.items(), key=lambda item: item[0])
 
 
-def main() -> int:
-    args = parse_args()
-    project_path = Path(args.project_path).expanduser().resolve()
-    data_dir = Path(args.data_dir).expanduser().resolve()
-
-    if not project_path.exists():
-        raise FileNotFoundError(f"Project JSON not found: {project_path}")
-
+def export_project(project_path: Path, data_dir: Path, args: argparse.Namespace) -> dict:
+    """Export one VAA project and return its manifest summary."""
     project = read_project(project_path)
     video_path = Path(project["video_path"]).expanduser()
     if not video_path.exists():
@@ -474,6 +505,51 @@ def main() -> int:
         json.dump(summary, file_obj, indent=2, ensure_ascii=False)
 
     print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return summary
+
+
+def main() -> int:
+    args = parse_args()
+    data_dir = Path(args.data_dir).expanduser().resolve()
+
+    if args.projects_path:
+        projects_path = Path(args.projects_path).expanduser().resolve()
+        project_paths = discover_project_paths(projects_path)
+        if not project_paths:
+            raise FileNotFoundError(f"No project JSON files found in directory: {projects_path}")
+
+        summaries = []
+        failures = []
+        for project_path in project_paths:
+            try:
+                summaries.append(export_project(project_path, data_dir, args))
+            except Exception as exc:
+                failures.append({"project_path": str(project_path), "error": str(exc)})
+                print(
+                    json.dumps(
+                        {"project_path": str(project_path), "error": str(exc)},
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                )
+
+        batch_summary = {
+            "projects_path": str(projects_path),
+            "data_dir": str(data_dir),
+            "num_projects": len(project_paths),
+            "num_succeeded": len(summaries),
+            "num_failed": len(failures),
+            "failures": failures,
+        }
+        ensure_dir(data_dir)
+        with open(data_dir / "batch_manifest.json", "w", encoding="utf-8") as file_obj:
+            json.dump(batch_summary, file_obj, indent=2, ensure_ascii=False)
+
+        print(json.dumps(batch_summary, indent=2, ensure_ascii=False))
+        return 1 if failures else 0
+
+    project_path = resolve_single_project_path(Path(args.project_path).expanduser().resolve())
+    export_project(project_path, data_dir, args)
     return 0
 
 
