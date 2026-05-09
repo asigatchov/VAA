@@ -36,8 +36,6 @@ Choose from:
 - 🔵 Reception  
 - 🔷 Set
 - 🟠 Attack
-- 🟢 Block
-- 🟡 Dig
 
 ### Step 2: Draw Box
 - Click and drag on canvas to create box
@@ -83,8 +81,6 @@ Each action class has a unique color:
 | Reception | 🔵 Cyan | #4ECDC4 |
 | Set | 🔷 Blue | #45B7D1 |
 | Attack | 🟠 Orange | #FFA07A |
-| Block | 🟢 Green | #98D8C8 |
-| Dig | 🟡 Yellow | #F7DC6F |
 
 ---
 

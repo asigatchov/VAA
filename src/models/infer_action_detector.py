@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iou-threshold", type=float, default=0.5)
     parser.add_argument("--max-detections", type=int, default=100)
     parser.add_argument("--actions-only", action="store_true", help="Drop helper player/ball detections.")
+    parser.add_argument("--view", action="store_true", help="Show live cv2 preview window; press q or Esc to stop.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -272,14 +273,22 @@ def infer_video(args: argparse.Namespace, model: VballActionDetector, config: di
             for det in detections:
                 counter[det.class_name] += 1
             frames.append({"frame": frame_idx, "detections": detections_to_json(detections)})
-            if writer is not None:
+            if writer is not None or args.view:
                 frame = cache.get_bgr(frame_idx)
                 draw_detections(frame, detections)
-                writer.write(frame)
+                if writer is not None:
+                    writer.write(frame)
+                if args.view:
+                    cv2.imshow("VballActionDetector", frame)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (27, ord("q")):
+                        break
     finally:
         capture.release()
         if writer is not None:
             writer.release()
+        if args.view:
+            cv2.destroyAllWindows()
 
     return {
         "video": str(video_path),

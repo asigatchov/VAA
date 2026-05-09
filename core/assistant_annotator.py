@@ -234,7 +234,7 @@ class AssistantAnnotator:
     resolution: int = 640
     person_threshold: float = 0.55
     ball_threshold: float = 0.12
-    mixformer_model_path: str = "out/mixformerv2_base.onnx"
+    mixformer_model_path: str = "weights/mixformerv2_base.onnx"
     mixformer_template_size: Optional[int] = None
     mixformer_search_size: Optional[int] = None
     mixformer_template_factor: Optional[float] = None

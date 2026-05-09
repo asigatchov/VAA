@@ -5,7 +5,7 @@ DATASET_PATH = "/home/nssd/gled/vb/dataset-action4/"
 
 DATASET_PATH = "datasets-coco-split/"
 
-MYMODEL_DIR = "./model_action4_20260421_02"
+MYMODEL_DIR = "./model_action4_2026042_01"
 
 model = RFDETRMedium()
 #model = RFDETRNano()

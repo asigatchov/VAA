@@ -222,6 +222,219 @@ class VballActionDetectorV2(nn.Module):
         return result
 
 
+class VballInteractionActionClassifier(nn.Module):
+    """Crop classifier with temporal ball-trajectory fusion and auxiliary box heads."""
+
+    def __init__(self, in_dim: int = 9, num_classes: int = 4, dropout: float = 0.2, traj_dim: int = 128):
+        super().__init__()
+        from .vballnet_grid_v1b import VballNetGridV1b
+
+        self.in_dim = int(in_dim)
+        self.num_classes = int(num_classes)
+        self.traj_dim = int(traj_dim)
+
+        backbone = VballNetGridV1b(in_dim=self.in_dim, out_dim=27)
+        self.features = backbone.features
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.traj_encoder = nn.Sequential(
+            nn.Linear(self.in_dim * 3, self.traj_dim),
+            nn.SiLU(inplace=True),
+            nn.Dropout(float(dropout)),
+            nn.Linear(self.traj_dim, self.traj_dim),
+            nn.SiLU(inplace=True),
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(512 + self.traj_dim, 256),
+            nn.SiLU(inplace=True),
+            nn.Dropout(float(dropout)),
+        )
+        self.action_head = nn.Linear(256, self.num_classes)
+        self.player_box_head = nn.Linear(256, 4)
+        self.ball_box_head = nn.Linear(256, 4)
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        temporal_ball_positions: torch.Tensor,
+        temporal_ball_valid: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        feat = self.features(image)
+        pooled = self.pool(feat).flatten(1)
+        valid = temporal_ball_valid.float().unsqueeze(-1)
+        traj_input = torch.cat(
+            [
+                temporal_ball_positions.float() * valid,
+                temporal_ball_valid.float().unsqueeze(-1),
+            ],
+            dim=-1,
+        ).flatten(1)
+        traj_feat = self.traj_encoder(traj_input)
+        fused = self.fusion(torch.cat([pooled, traj_feat], dim=1))
+        return {
+            "logits": self.action_head(fused),
+            "player_box": torch.sigmoid(self.player_box_head(fused)),
+            "ball_box": torch.sigmoid(self.ball_box_head(fused)),
+        }
+
+
+class VballInteractionActionClassifierTiny(nn.Module):
+    """CPU-friendly interaction crop classifier with the same output contract."""
+
+    def __init__(self, in_dim: int = 5, num_classes: int = 4, dropout: float = 0.2, traj_dim: int = 64):
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.num_classes = int(num_classes)
+        self.traj_dim = int(traj_dim)
+        self.features = nn.Sequential(
+            nn.Conv2d(self.in_dim, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.SiLU(inplace=True),
+            DSConvBlock(32, 48, stride=2),
+            DSConvBlock(48, 64),
+            DSConvBlock(64, 96, stride=2),
+            DSConvBlock(96, 128),
+            DSConvBlock(128, 160, stride=2),
+            DSConvBlock(160, 192),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.traj_encoder = nn.Sequential(
+            nn.Linear(self.in_dim * 3, self.traj_dim),
+            nn.SiLU(inplace=True),
+            nn.Dropout(float(dropout)),
+            nn.Linear(self.traj_dim, self.traj_dim),
+            nn.SiLU(inplace=True),
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(192 + self.traj_dim, 192),
+            nn.SiLU(inplace=True),
+            nn.Dropout(float(dropout)),
+        )
+        self.action_head = nn.Linear(192, self.num_classes)
+        self.player_box_head = nn.Linear(192, 4)
+        self.ball_box_head = nn.Linear(192, 4)
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        temporal_ball_positions: torch.Tensor,
+        temporal_ball_valid: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        pooled = self.pool(self.features(image)).flatten(1)
+        valid = temporal_ball_valid.float().unsqueeze(-1)
+        traj_input = torch.cat(
+            [
+                temporal_ball_positions.float() * valid,
+                temporal_ball_valid.float().unsqueeze(-1),
+            ],
+            dim=-1,
+        ).flatten(1)
+        traj_feat = self.traj_encoder(traj_input)
+        fused = self.fusion(torch.cat([pooled, traj_feat], dim=1))
+        return {
+            "logits": self.action_head(fused),
+            "player_box": torch.sigmoid(self.player_box_head(fused)),
+            "ball_box": torch.sigmoid(self.ball_box_head(fused)),
+        }
+
+
+class ReLUDSConvBlock(nn.Module):
+    """CPU/export-friendly depthwise-separable conv block with ReLU."""
+
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                in_channels,
+                kernel_size=3,
+                stride=stride,
+                padding=1,
+                groups=in_channels,
+                bias=False,
+            ),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class VballInteractionActionClassifierTinyV2(nn.Module):
+    """TinyActionCPU-v2: ReLU crop classifier with Conv1d ball trajectory branch."""
+
+    uses_ball_radius = True
+
+    def __init__(self, in_dim: int = 9, num_classes: int = 4, dropout: float = 0.1, traj_dim: int = 64):
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.num_classes = int(num_classes)
+        self.traj_dim = int(traj_dim)
+        self.features = nn.Sequential(
+            nn.Conv2d(self.in_dim, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            ReLUDSConvBlock(32, 48, stride=2),
+            ReLUDSConvBlock(48, 64),
+            ReLUDSConvBlock(64, 96, stride=2),
+            ReLUDSConvBlock(96, 128),
+            ReLUDSConvBlock(128, 160, stride=2),
+            ReLUDSConvBlock(160, 192),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.traj_encoder = nn.Sequential(
+            nn.Conv1d(4, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(64),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(64, self.traj_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(192 + self.traj_dim, 192),
+            nn.ReLU(inplace=True),
+            nn.Dropout(float(dropout)),
+        )
+        self.action_head = nn.Linear(192, self.num_classes)
+        self.player_box_head = nn.Linear(192, 4)
+        self.ball_center_head = nn.Linear(192, 2)
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        temporal_ball_positions: torch.Tensor,
+        temporal_ball_valid: torch.Tensor,
+        temporal_ball_radii: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        pooled = self.pool(self.features(image)).flatten(1)
+        valid = temporal_ball_valid.float().unsqueeze(-1)
+        if temporal_ball_radii is None:
+            temporal_ball_radii = temporal_ball_valid.float() * 0.0
+        radius = temporal_ball_radii.float().unsqueeze(-1) * valid
+        traj = torch.cat(
+            [
+                temporal_ball_positions.float() * valid,
+                valid,
+                radius,
+            ],
+            dim=-1,
+        ).permute(0, 2, 1)
+        traj_feat = self.traj_encoder(traj)
+        fused = self.fusion(torch.cat([pooled, traj_feat], dim=1))
+        return {
+            "logits": self.action_head(fused),
+            "player_box": torch.sigmoid(self.player_box_head(fused)),
+            "ball_center": torch.sigmoid(self.ball_center_head(fused)),
+        }
+
+
 def decode_boxes(regression: torch.Tensor, grid_h: int, grid_w: int) -> torch.Tensor:
     """Decode raw regression to normalized ``cx, cy, w, h`` boxes."""
 
