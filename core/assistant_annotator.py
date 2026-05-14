@@ -13,6 +13,7 @@ from rfdetr.assets.coco_classes import COCO_CLASSES
 from supervision import Detections as SupervisionDetections
 
 from core.annotation_manager import AnnotationManager
+from core.ball_csv import compute_ball_center_radius_from_normalized_box
 
 try:
     import onnxruntime
@@ -249,6 +250,141 @@ class AssistantAnnotator:
     _mixformer_search_size_resolved: int | None = field(default=None, init=False, repr=False)
     _mixformer_template_factor_resolved: float | None = field(default=None, init=False, repr=False)
     _mixformer_search_factor_resolved: float | None = field(default=None, init=False, repr=False)
+
+    def annotate_ball_track(
+        self,
+        processor,
+        annotations: AnnotationManager,
+        start_frame: int,
+        end_frame: int,
+        ball_class_id: int,
+        seed_box: Tuple[float, float, float, float],
+        replace_existing: bool = True,
+        progress_callback: Optional[Callable[[int, int, int], None]] = None,
+        status_callback: Optional[Callable[[str], None]] = None,
+        min_confidence: float = 0.0,
+        stop_callback: Optional[Callable[[], bool]] = None,
+        frame_result_callback: Optional[Callable[[int, Tuple[int, float, float, float, float], Tuple[int, int, int]], None]] = None,
+    ) -> Dict[str, object]:
+        """Track one seeded ball box forward until end_frame."""
+        try:
+            return self._annotate_ball_track_impl(
+                processor=processor,
+                annotations=annotations,
+                start_frame=int(start_frame),
+                end_frame=int(end_frame),
+                ball_class_id=int(ball_class_id),
+                seed_box=seed_box,
+                replace_existing=replace_existing,
+                progress_callback=progress_callback,
+                status_callback=status_callback,
+                min_confidence=float(min_confidence),
+                stop_callback=stop_callback,
+                frame_result_callback=frame_result_callback,
+            )
+        except RuntimeError as exc:
+            return {"ok": False, "reason": "model_error", "message": str(exc)}
+        except Exception as exc:
+            return {"ok": False, "reason": "assistant_error", "message": str(exc)}
+
+    def _annotate_ball_track_impl(
+        self,
+        processor,
+        annotations: AnnotationManager,
+        start_frame: int,
+        end_frame: int,
+        ball_class_id: int,
+        seed_box: Tuple[float, float, float, float],
+        replace_existing: bool,
+        progress_callback: Optional[Callable[[int, int, int], None]],
+        status_callback: Optional[Callable[[str], None]],
+        min_confidence: float,
+        stop_callback: Optional[Callable[[], bool]],
+        frame_result_callback: Optional[Callable[[int, Tuple[int, float, float, float, float], Tuple[int, int, int]], None]],
+    ) -> Dict[str, object]:
+        """Internal MixFormer-only ball tracking path."""
+        total_frames = int(getattr(processor, "total_frames", 0))
+        if total_frames <= 0:
+            return {"ok": False, "reason": "no_frames"}
+        if self.detector_backend != MIXFORMER_BACKEND:
+            return {
+                "ok": False,
+                "reason": "unsupported_backend",
+                "message": "Ball auto-markup requires MixFormerV2 ONNX backend.",
+            }
+
+        start_frame = max(0, min(int(start_frame), total_frames - 1))
+        end_frame = max(start_frame, min(int(end_frame), total_frames - 1))
+
+        seed_image = processor.get_frame(start_frame)
+        if seed_image is None:
+            return {"ok": False, "reason": "no_seed_frame", "message": "Failed to read ball seed frame."}
+
+        frame_height, frame_width = seed_image.shape[:2]
+        ball_seed = self._normalized_box_to_xywh(seed_box, frame_width, frame_height)
+
+        if replace_existing:
+            annotations.clear_boxes_by_class_ids_in_range(
+                start_frame,
+                end_frame,
+                {ball_class_id},
+            )
+
+        if status_callback is not None:
+            status_callback("MixFormerV2: tracking ball until rally pause or clip end...")
+
+        created_boxes = 0
+        ball_points: Dict[int, Tuple[int, int, int]] = {}
+        last_frame = start_frame
+
+        def on_tracked_frame(frame_idx: int, xywh: tuple[float, float, float, float]) -> None:
+            nonlocal created_boxes, last_frame
+            last_frame = int(frame_idx)
+            ball_box = self._xywh_to_normalized_box(ball_class_id, xywh, frame_width, frame_height)
+            annotations.add_yolo_box(frame_idx, ball_box)
+            created_boxes += 1
+            source_x, source_y, radius_px = compute_ball_center_radius_from_normalized_box(
+                ball_box[1],
+                ball_box[2],
+                ball_box[3],
+                ball_box[4],
+                int(getattr(processor, "width", frame_width)),
+                int(getattr(processor, "height", frame_height)),
+            )
+            ball_points[frame_idx] = (source_x, source_y, radius_px)
+            if frame_result_callback is not None:
+                frame_result_callback(frame_idx, ball_box, ball_points[frame_idx])
+
+        ball_tracks = self._track_mixformer_object(
+            processor=processor,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            init_bbox=ball_seed,
+            progress_offset=0,
+            progress_total=max(1, end_frame - start_frame + 1),
+            progress_callback=progress_callback,
+            status_callback=status_callback,
+            label="ball",
+            min_confidence=min_confidence,
+            stop_callback=stop_callback,
+            frame_callback=on_tracked_frame,
+        )
+
+        if not ball_tracks:
+            return {"ok": False, "reason": "no_tracks", "message": "MixFormer did not produce ball tracks."}
+
+        if progress_callback is not None:
+            progress_callback(len(ball_tracks), max(1, end_frame - start_frame + 1), last_frame)
+
+        return {
+            "ok": True,
+            "start_frame": start_frame,
+            "end_frame": last_frame,
+            "frames": max(0, last_frame - start_frame + 1),
+            "boxes_created": created_boxes,
+            "ball_points": ball_points,
+            "detector_backend": self.detector_backend,
+        }
 
     def annotate_clip(
         self,
@@ -666,6 +802,9 @@ class AssistantAnnotator:
         progress_callback: Optional[Callable[[int, int, int], None]],
         status_callback: Optional[Callable[[str], None]],
         label: str,
+        min_confidence: float = 0.0,
+        stop_callback: Optional[Callable[[], bool]] = None,
+        frame_callback: Optional[Callable[[int, tuple[float, float, float, float]], None]] = None,
     ) -> Dict[int, tuple[float, float, float, float]]:
         """Track one seeded object forward across the clip."""
         seed_image = processor.get_frame(start_frame)
@@ -675,6 +814,8 @@ class AssistantAnnotator:
         tracks: Dict[int, tuple[float, float, float, float]] = {
             start_frame: tuple(float(value) for value in init_bbox)
         }
+        if frame_callback is not None:
+            frame_callback(start_frame, tracks[start_frame])
         step_index = progress_offset
         if progress_callback is not None:
             progress_callback(step_index, progress_total, start_frame)
@@ -682,11 +823,17 @@ class AssistantAnnotator:
         runner = self._create_mixformer_runner(status_callback=status_callback)
         runner.initialize(seed_image, init_bbox)
         for frame_idx in range(start_frame + 1, end_frame + 1):
+            if stop_callback is not None and stop_callback():
+                break
             frame_image = processor.get_frame(frame_idx)
             if frame_image is None:
                 continue
             result = runner.track(frame_image)
+            if float(result.get("conf_score", 0.0)) < float(min_confidence):
+                break
             tracks[frame_idx] = tuple(float(value) for value in result["target_bbox"])
+            if frame_callback is not None:
+                frame_callback(frame_idx, tracks[frame_idx])
             if progress_callback is not None:
                 step_index += 1
                 progress_callback(step_index, progress_total, frame_idx)

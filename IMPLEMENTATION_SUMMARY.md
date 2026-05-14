@@ -2,9 +2,10 @@
 
 ## Project Completion Status
 
-✅ **All tasks completed successfully!**
+✅ Core annotator implemented  
+✅ VBallNet ball-markup workflow added
 
-The Volleyball Action Annotator (VAA) application has been fully implemented based on the design document.
+The Volleyball Action Annotator (VAA) now includes both the original rally/action annotation flow and a VBallNet-oriented match workflow for ball markup across clip directories.
 
 ## Implemented Components
 
@@ -36,6 +37,9 @@ The Volleyball Action Annotator (VAA) application has been fully implemented bas
   - Complete application window with menu bar
   - Playback controls and timeline integration
   - Action annotation workflow
+  - Match mode (`Open Match...`) for `video/` + `csv/` directories
+  - Sequential clip loading inside one match
+  - Ball CSV load/save with `Radius` support
   - Export functionality
   - Dark theme styling
   - Comprehensive keyboard shortcuts
@@ -95,11 +99,21 @@ The Volleyball Action Annotator (VAA) application has been fully implemented bas
 - [x] Class-specific colors
 - [x] Per-frame storage
 - [x] Visual feedback
+- [x] Ball box center/radius sync into ball CSV rows
 
 ### ✅ Display Modes
 - [x] Normal frame mode
 - [x] Superframe mode toggle (F1)
 - [x] Bounding box visibility toggle (F2)
+
+### ✅ VBallNet Ball Match Mode
+- [x] Open match directory with `video/` and `csv/`
+- [x] Pair each video with `<stem>_ball.csv`
+- [x] Auto-advance to the next clip during playback
+- [x] Manual ball point markup on frame
+- [x] Ball box markup with radius saved to CSV
+- [x] Save current clip CSV
+- [x] Save all match CSV files on project save
 
 ### ✅ Export Functionality
 - [x] YOLO format (.txt files in labels/ directory)
@@ -247,8 +261,8 @@ The implementation fully adheres to the design document specifications:
 
 ## Conclusion
 
-The Volleyball Action Annotator application is **complete and ready for use**. All core features from the design document have been implemented, tested, and documented. The application provides a professional, user-friendly interface for annotating volleyball match videos with temporal action markers and spatial bounding boxes, exporting standardized datasets for machine learning model training.
+The Volleyball Action Annotator application is ready for mixed workflows: rally/action markup and VBallNet ball markup. In addition to temporal action ranges and spatial boxes, the app now supports match-folder navigation and persistent ball CSV export with radius metadata for each frame.
 
 **Status**: ✅ Production Ready
 **Version**: 1.0
-**Last Updated**: 2025-01-12
+**Last Updated**: 2026-05-10

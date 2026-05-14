@@ -16,6 +16,7 @@ from PyQt6.QtGui import QAction, QKeySequence, QImage, QPixmap
 from core.video_processor import VideoProcessor
 from core.annotation_manager import AnnotationManager
 from core.assistant_annotator import AssistantAnnotator
+from core.ball_csv import build_ball_data_from_yolo_boxes, compute_ball_center_radius_from_normalized_box
 from core.yolo_tracker import YOLOTracker
 from config import AnnotationConfig, UIConfig
 from ui.image_canvas import ImageCanvas
@@ -48,7 +49,14 @@ class VideoAnnotationApp(QMainWindow):
         self.current_action4_json_path: Optional[Path] = None
         self.current_ball_data = []
         self.current_ball_lookup = {}
+        self.current_clip_ball_dirty = False
         self.selected_rally_id: Optional[int] = None
+        self.match_dir: Optional[Path] = None
+        self.match_entries: list[dict] = []
+        self.current_match_index: Optional[int] = None
+        self.annotation_mode = "action"
+        self.ball_tracking_in_progress = False
+        self.stop_ball_tracking_requested = False
         self.mixformer_target_frame_idx: Optional[int] = None
         self.mixformer_seed_frame_idx: Optional[int] = None
         self.mixformer_ball_seed_box: Optional[tuple[float, float, float, float]] = None
@@ -103,6 +111,7 @@ class VideoAnnotationApp(QMainWindow):
         self.canvas.box_class_changed.connect(self.on_box_class_changed)
         self.canvas.box_geometry_changed.connect(self.on_box_geometry_changed)
         self.canvas.ball_point_set.connect(self.on_ball_point_set)
+        self.canvas.ball_markup_cleared.connect(self.on_ball_markup_cleared)
         self.canvas.assistant_click_requested.connect(self.on_assistant_click)
         left_panel.addWidget(self.canvas, stretch=1)
         
@@ -160,6 +169,13 @@ class VideoAnnotationApp(QMainWindow):
         control_bar.addWidget(self.next_annotated_btn)
         
         # Add class selector for drawing
+        control_bar.addWidget(QLabel("Mode:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Action", "action")
+        self.mode_combo.addItem("Ball", "ball")
+        self.mode_combo.currentIndexChanged.connect(self.on_annotation_mode_changed)
+        control_bar.addWidget(self.mode_combo)
+
         control_bar.addWidget(QLabel("Draw Class:"))
         self.class_combo = QComboBox()
         for class_id, class_name in sorted(self.annot_config.box_classes.items()):
@@ -273,6 +289,10 @@ class VideoAnnotationApp(QMainWindow):
         open_action.setShortcut(QKeySequence.StandardKey.Open)
         open_action.triggered.connect(self.load_video)
         file_menu.addAction(open_action)
+
+        open_match_action = QAction("Open &Match...", self)
+        open_match_action.triggered.connect(self.load_match)
+        file_menu.addAction(open_match_action)
         
         load_project_action = QAction("&Load Project...", self)
         load_project_action.triggered.connect(self.load_project)
@@ -282,6 +302,10 @@ class VideoAnnotationApp(QMainWindow):
         save_action.setShortcut(QKeySequence.StandardKey.Save)
         save_action.triggered.connect(self.save_project)
         file_menu.addAction(save_action)
+
+        recalc_ball_radius_action = QAction("Recalc Ball &Radius", self)
+        recalc_ball_radius_action.triggered.connect(self.recalc_ball_radius_for_current_clip)
+        file_menu.addAction(recalc_ball_radius_action)
         
         file_menu.addSeparator()
         
@@ -332,6 +356,18 @@ class VideoAnnotationApp(QMainWindow):
         cancel_action_act.setShortcut("Escape")
         cancel_action_act.triggered.connect(self.cancel_rally)
         annot_menu.addAction(cancel_action_act)
+
+        nav_menu = menubar.addMenu("&Navigation")
+
+        prev_reel_action = QAction("&Previous Reel", self)
+        prev_reel_action.setShortcut("Ctrl+[")
+        prev_reel_action.triggered.connect(self.open_previous_reel)
+        nav_menu.addAction(prev_reel_action)
+
+        next_reel_action = QAction("&Next Reel", self)
+        next_reel_action.setShortcut("Ctrl+]")
+        next_reel_action.triggered.connect(self.open_next_reel)
+        nav_menu.addAction(next_reel_action)
         
         # Help menu
         help_menu = menubar.addMenu("&Help")
@@ -444,6 +480,9 @@ class VideoAnnotationApp(QMainWindow):
             return
         
         try:
+            self.match_dir = None
+            self.match_entries = []
+            self.current_match_index = None
             self._open_video_with_project(Path(file_path))
             
         except Exception as e:
@@ -452,11 +491,20 @@ class VideoAnnotationApp(QMainWindow):
     
     def toggle_play(self):
         """Toggle video playback."""
+        if self.ball_tracking_in_progress:
+            self.stop_ball_tracking_requested = True
+            self.status_bar.showMessage("Ball auto-markup stop requested. Releasing on the next frame.")
+            return
+
         if not self.processor:
             return
-        
+
+        if not self.is_playing and self.current_frame_idx >= self.processor.total_frames - 1:
+            if self.open_next_reel(start_playback=True):
+                return
+
         self.is_playing = not self.is_playing
-        
+
         if self.is_playing:
             self.timer.start()
             self.play_btn.setText("Pause")
@@ -475,8 +523,24 @@ class VideoAnnotationApp(QMainWindow):
         if self.processor and self.current_frame_idx < self.processor.total_frames - 1:
             self.step_frames(self.playback_step)
         elif self.is_playing:
-            # Stop playback at end
-            self.toggle_play()
+            self.is_playing = False
+            self.timer.stop()
+            self.play_btn.setText("Play")
+            self.status_bar.showMessage("Reached end of reel")
+
+    def open_previous_reel(self) -> bool:
+        """Open the previous reel inside the current match."""
+        opened = self._advance_to_match_clip(-1)
+        if not opened:
+            self.status_bar.showMessage("Previous reel is not available")
+        return opened
+
+    def open_next_reel(self, start_playback: bool = False) -> bool:
+        """Open the next reel inside the current match."""
+        opened = self._advance_to_match_clip(1, start_playback=start_playback)
+        if not opened:
+            self.status_bar.showMessage("Next reel is not available")
+        return opened
 
     def step_frames(self, offset: int):
         """Move current position by frame offset."""
@@ -585,6 +649,19 @@ class VideoAnnotationApp(QMainWindow):
             self.canvas.last_used_class_id = class_id
             class_name = self.annot_config.box_classes.get(class_id, f"Class {class_id}")
             self.status_bar.showMessage(f"Drawing class set to: {class_name}")
+
+    def on_annotation_mode_changed(self, index: int):
+        """Switch between action and ball Shift+Click behaviors."""
+        mode = self.mode_combo.itemData(index)
+        if not mode:
+            return
+        self.annotation_mode = str(mode)
+        self.canvas.set_annotation_mode(self.annotation_mode)
+        if self.annotation_mode == "ball":
+            self._set_draw_class_by_name("ball")
+            self.status_bar.showMessage("Annotation mode: ball. Shift+Click tracks the ball until rally pause or clip end.")
+        else:
+            self.status_bar.showMessage("Annotation mode: action. Shift+Click uses the current assistant clip workflow.")
 
     def on_action_type_selected(self, action_type: str):
         """Sync action flow selection with draw class selector."""
@@ -963,6 +1040,8 @@ class VideoAnnotationApp(QMainWindow):
     def on_box_added(self, box):
         """Handle box added event from canvas."""
         box_id = self.annotations.add_yolo_box(self.current_frame_idx, box)
+        if self._get_ball_class_id() is not None and int(box[0]) == int(self._get_ball_class_id()):
+            self._sync_ball_row_from_box_id(self.current_frame_idx, box_id)
         self._refresh_annotation_views()
         self._save_project_state()
         self.status_bar.showMessage(f"Box #{box_id} added to frame {self.current_frame_idx}")
@@ -975,6 +1054,12 @@ class VideoAnnotationApp(QMainWindow):
         Args:
             box_id_or_index: Can be box_id (int) for deletion by ID, or index for legacy support
         """
+        removed_ball = False
+        frame_boxes_before = self.annotations.yolo_boxes.get(self.current_frame_idx, {})
+        box_before = frame_boxes_before.get(box_id_or_index)
+        ball_class_id = self._get_ball_class_id()
+        if box_before is not None and ball_class_id is not None and int(box_before[0]) == int(ball_class_id):
+            removed_ball = True
         # Try to remove by ID first (new behavior)
         if self.annotations.remove_yolo_box_by_id(self.current_frame_idx, box_id_or_index):
             self.status_bar.showMessage(f"Box #{box_id_or_index} removed from frame {self.current_frame_idx}")
@@ -985,6 +1070,10 @@ class VideoAnnotationApp(QMainWindow):
             logger.debug(f"Box removed by index: {box_id_or_index}")
         else:
             logger.warning(f"Failed to remove box {box_id_or_index} from frame {self.current_frame_idx}")
+        if removed_ball:
+            remaining_boxes = self.annotations.yolo_boxes.get(self.current_frame_idx, {})
+            if ball_class_id is None or not any(int(box_data[0]) == int(ball_class_id) for box_data in remaining_boxes.values()):
+                self._remove_ball_point(self.current_frame_idx)
         self._refresh_annotation_views()
         self._save_project_state()
         self.update_display()
@@ -993,6 +1082,9 @@ class VideoAnnotationApp(QMainWindow):
 
     def on_box_class_changed(self, box_id_or_index: int, new_class_id: int):
         """Handle box class change event from canvas."""
+        previous_box = None
+        if self.current_frame_idx in self.annotations.yolo_boxes:
+            previous_box = self.annotations.yolo_boxes[self.current_frame_idx].get(box_id_or_index)
         updated_box_id = None
         updated = self.annotations.update_box_class(self.current_frame_idx, box_id_or_index, new_class_id)
 
@@ -1013,6 +1105,24 @@ class VideoAnnotationApp(QMainWindow):
             logger.warning(
                 f"Failed to change box class for {box_id_or_index} on frame {self.current_frame_idx}"
             )
+        ball_class_id = self._get_ball_class_id()
+        previous_class_id = int(previous_box[0]) if previous_box is not None else None
+        if updated and updated_box_id is not None and ball_class_id is not None:
+            if int(new_class_id) == int(ball_class_id):
+                self._sync_ball_row_from_box_id(self.current_frame_idx, updated_box_id)
+            elif previous_class_id == int(ball_class_id):
+                remaining_boxes = self.annotations.yolo_boxes.get(self.current_frame_idx, {})
+                replacement_ball_box_id = next(
+                    (
+                        box_id for box_id, box_data in remaining_boxes.items()
+                        if int(box_data[0]) == int(ball_class_id)
+                    ),
+                    None,
+                )
+                if replacement_ball_box_id is None:
+                    self._remove_ball_point(self.current_frame_idx)
+                else:
+                    self._sync_ball_row_from_box_id(self.current_frame_idx, replacement_ball_box_id)
         self._refresh_annotation_views()
         self._save_project_state()
         self.update_display()
@@ -1045,6 +1155,8 @@ class VideoAnnotationApp(QMainWindow):
             height,
         )
         if updated:
+            if self._get_ball_class_id() is not None and class_id == int(self._get_ball_class_id()):
+                self._sync_ball_row_from_box_id(self.current_frame_idx, box_id)
             self._refresh_annotation_views()
             self._save_project_state()
 
@@ -1055,12 +1167,30 @@ class VideoAnnotationApp(QMainWindow):
 
         source_x = int(round(x_norm * self.processor.width))
         source_y = int(round(y_norm * self.processor.height))
-        self._upsert_ball_point(self.current_frame_idx, source_x, source_y)
+        self._upsert_ball_point(self.current_frame_idx, source_x, source_y, 0)
         self._save_project_state()
         self.status_bar.showMessage(f"Ball marked at frame {self.current_frame_idx}: ({source_x}, {source_y})")
         self.update_display()
 
+    def on_ball_markup_cleared(self):
+        """Clear current-frame ball markup and mark ball as missing."""
+        self._clear_ball_markup_on_current_frame()
+        self._mark_ball_point_missing(self.current_frame_idx)
+        self._refresh_annotation_views()
+        self._save_project_state()
+        self.update_display()
+        self.status_bar.showMessage(
+            f"Ball markup cleared at frame {self.current_frame_idx}: visibility=0, x=-1, y=-1, radius=-1"
+        )
+
     def on_assistant_click(self, x_norm: float, y_norm: float):
+        """Dispatch Shift+Click by the selected annotation mode."""
+        if self.annotation_mode == "ball":
+            self.on_ball_assistant_click(x_norm, y_norm)
+            return
+        self.on_action_assistant_click(x_norm, y_norm)
+
+    def on_action_assistant_click(self, x_norm: float, y_norm: float):
         """Auto-annotate a 9-frame action clip around the clicked player center."""
         if not self.processor:
             return
@@ -1177,6 +1307,7 @@ class VideoAnnotationApp(QMainWindow):
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
+            self._clear_ball_points_in_range(clip_start, clip_end)
             result = self.assistant_annotator.annotate_clip(
                 processor=self.processor,
                 annotations=self.annotations,
@@ -1203,7 +1334,8 @@ class VideoAnnotationApp(QMainWindow):
             return
 
         for frame_idx, coords in result.get("ball_points", {}).items():
-            self._upsert_ball_point(int(frame_idx), int(coords[0]), int(coords[1]))
+            if not self._sync_ball_row_from_frame(int(frame_idx)):
+                self._upsert_ball_point(int(frame_idx), int(coords[0]), int(coords[1]))
 
         rally_started = self._maybe_start_rally_from_assistant_clip(action_type, result)
         self._advance_action_flow_after_markup(action_type)
@@ -1214,6 +1346,96 @@ class VideoAnnotationApp(QMainWindow):
         self.status_bar.showMessage(
             f"Assistant clip {result['start_frame']}-{result['end_frame']} for {action_type} via Shift+Click: "
             f"{result['boxes_created']} boxes, rally {rally_state}"
+        )
+
+    def on_ball_assistant_click(self, x_norm: float, y_norm: float):
+        """Track the ball forward from the current frame until rally pause or clip end."""
+        if not self.processor:
+            return
+
+        if self.assistant_annotator.detector_backend != "mixformer_v2_onnx":
+            self.status_bar.showMessage("Ball auto-markup requires assistant model MixFormerV2 ONNX.")
+            return
+
+        ball_class_id = self._get_ball_class_id()
+        if ball_class_id is None:
+            self.status_bar.showMessage("Ball auto-markup failed: ball class is not configured.")
+            return
+
+        start_frame = int(self.current_frame_idx)
+        stop_frame = self._get_ball_mode_stop_frame(start_frame)
+        seed_box = self._find_seed_box_for_frame(start_frame, "ball")
+        if seed_box is None:
+            seed_box = self._find_seed_box_for_click("ball", x_norm, y_norm)
+        if seed_box is None:
+            seed_box = self._build_default_ball_seed_box_for_frame(start_frame, x_norm, y_norm)
+        if seed_box is None:
+            self.status_bar.showMessage("Ball auto-markup failed: could not build a seed box.")
+            return
+
+        def update_progress(done: int, total: int, frame_idx: int):
+            total = max(1, int(total))
+            self.status_bar.showMessage(
+                f"Ball auto-markup running: frame {frame_idx} ({min(done + 1, total)}/{total})"
+            )
+            QApplication.processEvents()
+
+        def update_status(message: str):
+            self.status_bar.showMessage(message)
+            QApplication.processEvents()
+
+        def should_stop() -> bool:
+            QApplication.processEvents()
+            return self.stop_ball_tracking_requested
+
+        def on_frame_result(
+            frame_idx: int,
+            ball_box: tuple[int, float, float, float, float],
+            point_data: tuple[int, int, int],
+        ):
+            del ball_box
+            self._upsert_ball_point(int(frame_idx), int(point_data[0]), int(point_data[1]), int(point_data[2]))
+            self.current_frame_idx = int(frame_idx)
+            self.timeline.set_current_frame(self.current_frame_idx)
+            self.detail_timeline.set_current_frame(self.current_frame_idx)
+            self.update_display()
+            QApplication.processEvents()
+
+        self.ball_tracking_in_progress = True
+        self.stop_ball_tracking_requested = False
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self._clear_ball_points_in_range(start_frame, stop_frame)
+            result = self.assistant_annotator.annotate_ball_track(
+                processor=self.processor,
+                annotations=self.annotations,
+                start_frame=start_frame,
+                end_frame=stop_frame,
+                ball_class_id=ball_class_id,
+                seed_box=seed_box,
+                replace_existing=True,
+                progress_callback=update_progress,
+                status_callback=update_status,
+                stop_callback=should_stop,
+                frame_result_callback=on_frame_result,
+            )
+        finally:
+            self.ball_tracking_in_progress = False
+            QApplication.restoreOverrideCursor()
+
+        if not result.get("ok"):
+            message = result.get("message") or "Failed to auto-track the ball."
+            self.status_bar.showMessage(f"Ball auto-markup failed: {message}")
+            return
+
+        self._refresh_annotation_views()
+        self._save_project_state()
+        self.update_display()
+        stop_suffix = " (stopped by Space)" if self.stop_ball_tracking_requested else ""
+        self.stop_ball_tracking_requested = False
+        self.status_bar.showMessage(
+            f"Ball auto-markup {result['start_frame']}-{result['end_frame']} via Shift+Click: "
+            f"{result['boxes_created']} ball boxes{stop_suffix}"
         )
 
     def _maybe_start_rally_from_assistant_clip(self, action_type: str, result: dict) -> bool:
@@ -1343,6 +1565,67 @@ class VideoAnnotationApp(QMainWindow):
 
         candidates.sort(key=lambda item: (item[0], item[1]))
         return candidates[0][2]
+
+    def _find_seed_box_for_frame(self, frame_idx: int, class_name: str) -> Optional[tuple[float, float, float, float]]:
+        """Pick the first matching class box on a specific frame."""
+        class_id = next(
+            (candidate_id for candidate_id, candidate_name in self.annot_config.box_classes.items() if candidate_name == class_name),
+            None,
+        )
+        if class_id is None:
+            return None
+
+        frame_boxes = self.annotations.yolo_boxes.get(int(frame_idx), {})
+        for _, box_data in frame_boxes.items():
+            box_class_id, box_x, box_y, box_w, box_h = box_data
+            if int(box_class_id) == int(class_id):
+                return (float(box_x), float(box_y), float(box_w), float(box_h))
+        return None
+
+    def _build_default_ball_seed_box(self, x_norm: float, y_norm: float) -> Optional[tuple[float, float, float, float]]:
+        """Create a small default ball seed when no manual ball box exists yet."""
+        if not self.processor:
+            return None
+        default_radius_px = 12
+        current_ball_row = self.current_ball_lookup.get(self.current_frame_idx)
+        if current_ball_row is not None and len(current_ball_row) >= 5 and int(current_ball_row[4]) > 0:
+            default_radius_px = int(current_ball_row[4])
+        box_w = max(2, default_radius_px * 2) / max(1, self.processor.width)
+        box_h = max(2, default_radius_px * 2) / max(1, self.processor.height)
+        x_norm = max(box_w / 2.0, min(1.0 - box_w / 2.0, float(x_norm)))
+        y_norm = max(box_h / 2.0, min(1.0 - box_h / 2.0, float(y_norm)))
+        return (x_norm, y_norm, min(1.0, box_w), min(1.0, box_h))
+
+    def _build_default_ball_seed_box_for_frame(
+        self,
+        frame_idx: int,
+        x_norm: float,
+        y_norm: float,
+    ) -> Optional[tuple[float, float, float, float]]:
+        """Build a default seed, preferring existing CSV coordinates on the chosen frame."""
+        if not self.processor:
+            return None
+        current_ball_row = self.current_ball_lookup.get(int(frame_idx))
+        if current_ball_row is not None and len(current_ball_row) >= 4 and int(current_ball_row[1]) > 0:
+            seeded_x_norm = max(0.0, min(1.0, float(current_ball_row[2]) / max(1, self.processor.width)))
+            seeded_y_norm = max(0.0, min(1.0, float(current_ball_row[3]) / max(1, self.processor.height)))
+            return self._build_default_ball_seed_box(seeded_x_norm, seeded_y_norm)
+        return self._build_default_ball_seed_box(x_norm, y_norm)
+
+    def _get_ball_mode_stop_frame(self, frame_idx: Optional[int] = None) -> int:
+        """Stop ball tracking at current rally end when available, otherwise at clip end."""
+        if not self.processor:
+            return 0
+        current_frame = self.current_frame_idx if frame_idx is None else int(frame_idx)
+        for rally in self.annotations.rallies:
+            start_frame = int(rally.get("start_frame", -1))
+            end_frame = int(rally.get("end_frame", -1))
+            if start_frame <= current_frame <= end_frame:
+                return end_frame
+        pending = self.annotations.current_rally_start
+        if pending is not None and int(pending.get("frame", -1)) <= current_frame:
+            return self.processor.total_frames - 1
+        return self.processor.total_frames - 1
         
     def copy_boxes(self):
         """Copy all boxes from current frame to clipboard (Ctrl+C)."""
@@ -1493,6 +1776,11 @@ class VideoAnnotationApp(QMainWindow):
                 return
         
         # Cleanup
+        self._save_project_state()
+        if self.match_entries:
+            self._save_all_match_ball_csvs()
+        else:
+            self._save_current_ball_csv()
         if self.processor:
             self.processor.release()
         
@@ -1506,7 +1794,55 @@ class VideoAnnotationApp(QMainWindow):
             return
 
         self._save_project_state()
-        self.status_bar.showMessage(f"Project saved: {self.current_project_json}")
+        saved_csv_count = self._save_all_match_ball_csvs() if self.match_entries else self._save_current_ball_csv()
+        suffix = f" | saved {saved_csv_count} ball CSV" + ("s" if saved_csv_count != 1 else "")
+        self.status_bar.showMessage(f"Project saved: {self.current_project_json}{suffix}")
+
+    def recalc_ball_radius_for_current_clip(self):
+        """Rebuild current clip ball_data from existing ball boxes."""
+        if not self.processor:
+            QMessageBox.warning(self, "No Clip", "Please load a video or match clip first.")
+            return
+
+        ball_class_id = self._get_ball_class_id()
+        if ball_class_id is None:
+            QMessageBox.warning(self, "Recalc Ball Radius", "Ball class is not configured.")
+            return
+
+        updated_frames = 0
+        rebuilt_rows = build_ball_data_from_yolo_boxes(
+            self.annotations.yolo_boxes,
+            int(ball_class_id),
+            int(self.processor.width),
+            int(self.processor.height),
+            existing_ball_data=self.current_ball_data,
+            preserve_positive_without_box=False,
+        )
+        original_lookup_frames = set(self.current_ball_lookup.keys())
+        self.current_ball_data = rebuilt_rows
+        self._rebuild_ball_lookup()
+        updated_frames = len(
+            [
+                frame_idx for frame_idx in self.current_ball_lookup
+                if frame_idx in original_lookup_frames or frame_idx in self.annotations.yolo_boxes
+            ]
+        )
+        self.current_clip_ball_dirty = True
+
+        if updated_frames <= 0:
+            QMessageBox.information(
+                self,
+                "Recalc Ball Radius",
+                "No ball boxes were found on the current clip."
+            )
+            return
+
+        self._save_project_state()
+        saved_csv_count = self._save_all_match_ball_csvs() if self.match_entries else self._save_current_ball_csv()
+        self.update_display()
+        self.status_bar.showMessage(
+            f"Recalculated ball center/radius for {updated_frames} frame(s); saved {saved_csv_count} CSV file(s)"
+        )
 
     def load_project(self):
         """Load an existing project JSON."""
@@ -1528,10 +1864,45 @@ class VideoAnnotationApp(QMainWindow):
             QMessageBox.critical(self, "Load Project Error", f"Video file not found:\n{video_path}")
             return
 
+        self.match_dir = None
+        self.match_entries = []
+        self.current_match_index = None
         self._open_video_with_project(video_path, project_json)
 
-    def _open_video_with_project(self, video_path: Path, project_json: Optional[Path] = None):
+    def load_match(self):
+        """Load one match directory with video/ and csv/ subfolders."""
+        match_dir_raw = QFileDialog.getExistingDirectory(
+            self,
+            "Open Match Directory",
+            "/home/ubuntu/datasets/volleyball"
+        )
+        if not match_dir_raw:
+            return
+
+        match_dir = Path(match_dir_raw)
+        entries = self._discover_match_entries(match_dir)
+        if not entries:
+            QMessageBox.warning(
+                self,
+                "Open Match",
+                "No videos found. Expected a match directory with a video/ subfolder."
+            )
+            return
+
+        self.match_dir = match_dir
+        self.match_entries = entries
+        self.current_match_index = 0
+        self._open_match_entry(0)
+
+    def _open_video_with_project(
+        self,
+        video_path: Path,
+        project_json: Optional[Path] = None,
+        ball_csv_path: Optional[Path] = None,
+    ):
         """Open a video file and optionally load a specific project JSON."""
+        if self.current_video_path is not None and self.current_ball_csv_path is not None:
+            self._save_current_ball_csv()
         if self.processor:
             self.processor.release()
 
@@ -1543,18 +1914,22 @@ class VideoAnnotationApp(QMainWindow):
 
         self.current_frame_idx = 0
         self.is_playing = False
+        self.timer.stop()
+        self.play_btn.setText("Play")
         self.annotations = AnnotationManager(self.annot_config.box_classes)
         self.current_ball_data = []
         self.current_ball_lookup = {}
+        self.current_clip_ball_dirty = False
         self.selected_rally_id = None
 
         if project_json is not None:
             self.current_project_dir = project_json.parent
             self.current_project_json = project_json
             self.current_video_path = video_path
+            self.current_ball_csv_path = ball_csv_path if ball_csv_path is not None else None
             self._load_project_state(project_json)
         else:
-            self._load_or_create_project(video_path)
+            self._load_or_create_project(video_path, ball_csv_path)
 
         self.timeline.set_total_frames(self.processor.total_frames)
         self.timeline.set_current_frame(0)
@@ -1576,19 +1951,21 @@ class VideoAnnotationApp(QMainWindow):
             f"Loaded: {video_path} | {self.processor.total_frames} frames @ {self.processor.fps:.2f} fps"
         )
 
-    def _load_or_create_project(self, video_path: Path):
+    def _load_or_create_project(self, video_path: Path, ball_csv_path: Optional[Path] = None):
         """Create or load a project for the opened video."""
         self.projects_dir.mkdir(parents=True, exist_ok=True)
         project_name = video_path.stem
         project_dir = self.projects_dir / project_name
         project_dir.mkdir(parents=True, exist_ok=True)
         project_json = project_dir / f"{project_name}.json"
-        ball_csv_path = video_path.with_name(f"{video_path.stem}_predict_ball.csv")
+        resolved_ball_csv_path = ball_csv_path
+        if resolved_ball_csv_path is None:
+            resolved_ball_csv_path = video_path.with_name(f"{video_path.stem}_predict_ball.csv")
 
         self.current_project_dir = project_dir
         self.current_project_json = project_json
         self.current_video_path = video_path
-        self.current_ball_csv_path = ball_csv_path if ball_csv_path.exists() else None
+        self.current_ball_csv_path = resolved_ball_csv_path
         action4_json_path = video_path.with_name(f"{video_path.stem}_action4.json")
         self.current_action4_json_path = action4_json_path if action4_json_path.exists() else None
         self.current_ball_lookup = {}
@@ -1598,7 +1975,11 @@ class VideoAnnotationApp(QMainWindow):
             logger.info(f"Loaded existing project: {project_json}")
             return
 
-        self.current_ball_data = self._read_ball_csv(self.current_ball_csv_path) if self.current_ball_csv_path else []
+        self.current_ball_data = (
+            self._read_ball_csv(self.current_ball_csv_path)
+            if self.current_ball_csv_path and self.current_ball_csv_path.exists()
+            else []
+        )
         self._rebuild_ball_lookup()
         if self.current_action4_json_path:
             self._load_initial_action4_json(self.current_action4_json_path)
@@ -1672,6 +2053,7 @@ class VideoAnnotationApp(QMainWindow):
                         int(row.get("Visibility", 0)),
                         int(float(row.get("X", -1))),
                         int(float(row.get("Y", -1))),
+                        int(float(row.get("Radius", 0) or 0)),
                     ])
                 except (TypeError, ValueError):
                     continue
@@ -1696,7 +2078,8 @@ class VideoAnnotationApp(QMainWindow):
                 frame_idx = int(row[0])
             except (TypeError, ValueError):
                 continue
-            lookup[frame_idx] = [int(row[0]), int(row[1]), int(row[2]), int(row[3])]
+            radius = int(row[4]) if len(row) >= 5 else 0
+            lookup[frame_idx] = [int(row[0]), int(row[1]), int(row[2]), int(row[3]), radius]
         self.current_ball_lookup = lookup
 
     def _get_current_ball_position_normalized(self):
@@ -1735,9 +2118,9 @@ class VideoAnnotationApp(QMainWindow):
             max(0.0, min(1.0, y / self.processor.height)),
         )
 
-    def _upsert_ball_point(self, frame_idx: int, x: int, y: int):
+    def _upsert_ball_point(self, frame_idx: int, x: int, y: int, radius: int = 0):
         """Insert or update ball coordinates for a frame."""
-        payload = [int(frame_idx), 1, int(x), int(y)]
+        payload = [int(frame_idx), 1, int(x), int(y), max(0, int(radius))]
         row = self.current_ball_lookup.get(frame_idx)
         if row is None:
             self.current_ball_data.append(payload)
@@ -1747,6 +2130,48 @@ class VideoAnnotationApp(QMainWindow):
             row[1] = 1
             row[2] = int(x)
             row[3] = int(y)
+            if len(row) < 5:
+                row.append(max(0, int(radius)))
+            else:
+                row[4] = max(0, int(radius))
+        self.current_clip_ball_dirty = True
+
+    def _mark_ball_point_missing(self, frame_idx: int):
+        """Mark one frame as explicit invisible-ball annotation."""
+        payload = [int(frame_idx), 0, -1, -1, -1]
+        row = self.current_ball_lookup.get(frame_idx)
+        if row is None:
+            self.current_ball_data.append(payload)
+            self.current_ball_lookup[frame_idx] = payload
+        else:
+            row[0] = int(frame_idx)
+            row[1] = 0
+            row[2] = -1
+            row[3] = -1
+            if len(row) < 5:
+                row.append(-1)
+            else:
+                row[4] = -1
+        self.current_clip_ball_dirty = True
+
+    def _clear_ball_markup_on_current_frame(self):
+        """Remove all ball boxes from the current frame only."""
+        ball_class_id = self._get_ball_class_id()
+        if ball_class_id is None:
+            return
+        self.annotations.clear_boxes_by_class_ids_in_range(
+            self.current_frame_idx,
+            self.current_frame_idx,
+            {int(ball_class_id)},
+        )
+
+    def _remove_ball_point(self, frame_idx: int):
+        """Remove one ball row from the in-memory lookup."""
+        row = self.current_ball_lookup.pop(frame_idx, None)
+        if row is None:
+            return
+        self.current_ball_data = [candidate for candidate in self.current_ball_data if int(candidate[0]) != int(frame_idx)]
+        self.current_clip_ball_dirty = True
 
     def _count_boxes_in_range(self, start_frame: int, end_frame: int) -> dict:
         """Return box totals for an inclusive frame range."""
@@ -1780,6 +2205,7 @@ class VideoAnnotationApp(QMainWindow):
         if removed:
             self.current_ball_data = remaining_ball_data
             self._rebuild_ball_lookup()
+            self.current_clip_ball_dirty = True
 
         return removed
 
@@ -1821,7 +2247,7 @@ class VideoAnnotationApp(QMainWindow):
 
     @staticmethod
     def _normalize_ball_data(ball_data) -> list:
-        """Normalize legacy and current ball data into [frame, visibility, x, y]."""
+        """Normalize legacy and current ball data into [frame, visibility, x, y, radius]."""
         normalized = []
         if not isinstance(ball_data, list):
             return normalized
@@ -1834,6 +2260,7 @@ class VideoAnnotationApp(QMainWindow):
                         int(row.get("Visibility", 0)),
                         int(float(row.get("X", -1))),
                         int(float(row.get("Y", -1))),
+                        int(float(row.get("Radius", 0) or 0)),
                     ])
                 except (TypeError, ValueError):
                     continue
@@ -1844,11 +2271,206 @@ class VideoAnnotationApp(QMainWindow):
                         int(row[1]),
                         int(row[2]),
                         int(row[3]),
+                        int(row[4]) if len(row) >= 5 else 0,
                     ])
                 except (TypeError, ValueError):
                     continue
 
         return normalized
+
+    def _ball_csv_path_for_video(self, video_path: Path) -> Path:
+        """Return the default ball CSV path for one video."""
+        if self.match_dir is not None:
+            csv_dir = self.match_dir / "csv"
+            csv_dir.mkdir(parents=True, exist_ok=True)
+            return csv_dir / f"{video_path.stem}_ball.csv"
+        return video_path.with_name(f"{video_path.stem}_predict_ball.csv")
+
+    def _discover_match_entries(self, match_dir: Path) -> list[dict]:
+        """Collect one ordered list of video/CSV pairs from a match directory."""
+        video_dir = match_dir / "video"
+        csv_dir = match_dir / "csv"
+        if not video_dir.exists() or not video_dir.is_dir():
+            return []
+
+        entries = []
+        for video_path in sorted(video_dir.iterdir()):
+            if not video_path.is_file() or video_path.suffix.lower() not in {".mp4", ".avi", ".mov", ".mkv"}:
+                continue
+            entries.append(
+                {
+                    "video_path": video_path,
+                    "ball_csv_path": csv_dir / f"{video_path.stem}_ball.csv",
+                }
+            )
+        return entries
+
+    def _open_match_entry(self, index: int) -> bool:
+        """Open one match clip by index."""
+        if index < 0 or index >= len(self.match_entries):
+            return False
+
+        entry = self.match_entries[index]
+        self.current_match_index = index
+        self._open_video_with_project(
+            entry["video_path"],
+            ball_csv_path=entry["ball_csv_path"],
+        )
+        self.status_bar.showMessage(
+            f"Match {self.match_dir.name if self.match_dir else ''}: clip {index + 1}/{len(self.match_entries)} "
+            f"| {entry['video_path'].name}"
+        )
+        return True
+
+    def _advance_to_match_clip(self, offset: int, start_playback: bool = False) -> bool:
+        """Move to another clip inside the current match."""
+        if self.current_match_index is None or not self.match_entries:
+            return False
+        target_index = self.current_match_index + int(offset)
+        if target_index < 0 or target_index >= len(self.match_entries):
+            return False
+
+        opened = self._open_match_entry(target_index)
+        if opened and start_playback:
+            self.is_playing = True
+            self.play_btn.setText("Pause")
+            self.timer.start()
+        return opened
+
+    def _save_current_ball_csv(self) -> int:
+        """Persist the current clip ball CSV to disk."""
+        if self.current_ball_csv_path is None or self.processor is None:
+            return 0
+
+        normalized_rows = self._normalize_ball_data(self.current_ball_data)
+        for output_path in self._iter_ball_csv_output_paths(self.current_ball_csv_path):
+            self._write_ball_csv(output_path, normalized_rows, self.processor.total_frames)
+        self.current_clip_ball_dirty = False
+        return len(self._iter_ball_csv_output_paths(self.current_ball_csv_path))
+
+    def _save_all_match_ball_csvs(self) -> int:
+        """Persist ball CSVs for all match clips currently known to the UI."""
+        if not self.match_entries:
+            return self._save_current_ball_csv()
+
+        saved = self._save_current_ball_csv()
+        for entry in self.match_entries:
+            if self.current_video_path is not None and entry["video_path"] == self.current_video_path:
+                continue
+            project_json = self.projects_dir / entry["video_path"].stem / f"{entry['video_path'].stem}.json"
+            ball_rows = []
+            if project_json.exists():
+                try:
+                    with open(project_json, "r", encoding="utf-8") as file_obj:
+                        project_data = json.load(file_obj)
+                    ball_rows = self._normalize_ball_data(project_data.get("ball_data", []))
+                except (OSError, json.JSONDecodeError):
+                    ball_rows = []
+            if not ball_rows and entry["ball_csv_path"].exists():
+                ball_rows = self._read_ball_csv(entry["ball_csv_path"])
+            try:
+                cap = cv2.VideoCapture(str(entry["video_path"]))
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            finally:
+                cap.release()
+            normalized_rows = self._normalize_ball_data(ball_rows)
+            for output_path in self._iter_ball_csv_output_paths(entry["ball_csv_path"]):
+                self._write_ball_csv(output_path, normalized_rows, total_frames)
+                saved += 1
+        return saved
+
+    def _iter_ball_csv_output_paths(self, primary_path: Path) -> list[Path]:
+        """Return primary and mirrored repo-local CSV paths when both dataset trees exist."""
+        output_paths = [primary_path]
+        repo_data_dir = Path(__file__).resolve().parents[1] / "data"
+        datasets_root = Path("/home/ubuntu/datasets/volleyball")
+        try:
+            relative_path = primary_path.relative_to(datasets_root)
+        except ValueError:
+            relative_path = None
+
+        if relative_path is not None:
+            mirror_path = repo_data_dir / relative_path
+            if mirror_path != primary_path and mirror_path.parent.exists():
+                output_paths.append(mirror_path)
+
+        unique_paths: list[Path] = []
+        seen = set()
+        for path in output_paths:
+            path_key = str(path)
+            if path_key in seen:
+                continue
+            seen.add(path_key)
+            unique_paths.append(path)
+        return unique_paths
+
+    def _write_ball_csv(self, csv_path: Path, ball_rows: list, total_frames: int):
+        """Write one ball CSV file with normalized rows and Radius column."""
+        rows_by_frame = {
+            int(row[0]): [
+                int(row[0]),
+                int(row[1]),
+                int(row[2]),
+                int(row[3]),
+                int(row[4]) if len(row) >= 5 else 0,
+            ]
+            for row in self._normalize_ball_data(ball_rows)
+        }
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(csv_path, "w", encoding="utf-8", newline="") as file_obj:
+            writer = csv.writer(file_obj)
+            writer.writerow(["Frame", "Visibility", "X", "Y", "Radius"])
+            for frame_idx in range(max(0, int(total_frames))):
+                row = rows_by_frame.get(frame_idx)
+                if row is None:
+                    writer.writerow([frame_idx, 0, -1, -1, 0])
+                else:
+                    writer.writerow(row)
+
+    def _get_ball_class_id(self) -> Optional[int]:
+        """Return configured class id for ball boxes."""
+        return next(
+            (
+                class_id for class_id, class_name in self.annot_config.box_classes.items()
+                if class_name == "ball"
+            ),
+            None,
+        )
+
+    def _sync_ball_row_from_box_id(self, frame_idx: int, box_id: int):
+        """Write ball center/radius from one saved ball box into current CSV rows."""
+        if self.processor is None:
+            return
+        frame_boxes = self.annotations.yolo_boxes.get(frame_idx, {})
+        box_data = frame_boxes.get(box_id)
+        if box_data is None:
+            return
+        ball_class_id = self._get_ball_class_id()
+        if ball_class_id is None or int(box_data[0]) != int(ball_class_id):
+            return
+        _, x_norm, y_norm, w_norm, h_norm = box_data
+        source_x, source_y, radius = compute_ball_center_radius_from_normalized_box(
+            float(x_norm),
+            float(y_norm),
+            float(w_norm),
+            float(h_norm),
+            int(self.processor.width),
+            int(self.processor.height),
+        )
+        self._upsert_ball_point(frame_idx, source_x, source_y, radius)
+
+    def _sync_ball_row_from_frame(self, frame_idx: int) -> bool:
+        """Sync ball_data from the first ball box found on a frame."""
+        frame_boxes = self.annotations.yolo_boxes.get(int(frame_idx), {})
+        ball_class_id = self._get_ball_class_id()
+        if ball_class_id is None:
+            return False
+        for box_id, box_data in frame_boxes.items():
+            if int(box_data[0]) != int(ball_class_id):
+                continue
+            self._sync_ball_row_from_box_id(int(frame_idx), int(box_id))
+            return True
+        return False
 
     @staticmethod
     def _now_iso() -> str:

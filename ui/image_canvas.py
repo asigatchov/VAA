@@ -16,6 +16,7 @@ class ImageCanvas(QLabel):
     box_class_changed = pyqtSignal(int, int)  # Emits (box_id_or_index, new_class_id)
     box_geometry_changed = pyqtSignal(int, float, float, float, float, int)  # box_index, x, y, w, h, box_id
     ball_point_set = pyqtSignal(float, float)  # Emits normalized x, y
+    ball_markup_cleared = pyqtSignal()  # Emits when ball markup should be cleared on current frame
     assistant_click_requested = pyqtSignal(float, float)  # Emits normalized x, y
     
     def __init__(self, parent=None):
@@ -58,9 +59,16 @@ class ImageCanvas(QLabel):
         self.visible_box_class_ids: Optional[set[int]] = None
         self.show_ball = True
         self.ball_markup_mode = False
+        self.annotation_mode = "action"
         self.ball_position: Optional[Tuple[float, float]] = None
         self.box_line_width = 2
         self.selected_line_width = 4
+        self.zoom_factor = 1.0
+        self.zoom_min = 1.0
+        self.zoom_max = 8.0
+        self.zoom_step = 1.2
+        self.zoom_center_norm: Tuple[float, float] = (0.5, 0.5)
+        self.last_left_click_norm: Optional[Tuple[float, float]] = None
         
         # Enable mouse tracking
         self.setMouseTracking(True)
@@ -76,6 +84,8 @@ class ImageCanvas(QLabel):
         self.current_pixmap = pixmap
         self.boxes = boxes if boxes is not None else []
         self.ball_position = ball_position
+        if self.ball_position is not None:
+            self.zoom_center_norm = self.ball_position
         self.selected_box_idx = None
         self.update()
 
@@ -123,6 +133,50 @@ class ImageCanvas(QLabel):
         """Enable or disable ball markup mode."""
         self.ball_markup_mode = enabled
 
+    def set_annotation_mode(self, mode: str):
+        """Set high-level annotation mode used by mouse gestures."""
+        self.annotation_mode = mode
+
+    def _get_view_geometry(self) -> tuple[int, int, int, int]:
+        """Return current image viewport geometry with zoom applied."""
+        if self.current_pixmap is None:
+            return (0, 0, 0, 0)
+
+        widget_rect = self.rect()
+        base_scaled = self.current_pixmap.scaled(
+            widget_rect.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        )
+        base_width = max(1, base_scaled.width())
+        base_height = max(1, base_scaled.height())
+        img_width = max(1, int(round(base_width * self.zoom_factor)))
+        img_height = max(1, int(round(base_height * self.zoom_factor)))
+
+        center_x_norm = max(0.0, min(1.0, float(self.zoom_center_norm[0])))
+        center_y_norm = max(0.0, min(1.0, float(self.zoom_center_norm[1])))
+        if self.zoom_factor <= self.zoom_min + 1e-6:
+            x_offset = (widget_rect.width() - img_width) // 2
+            y_offset = (widget_rect.height() - img_height) // 2
+            return x_offset, y_offset, img_width, img_height
+
+        x_offset = int(round(widget_rect.width() / 2.0 - center_x_norm * img_width))
+        y_offset = int(round(widget_rect.height() / 2.0 - center_y_norm * img_height))
+
+        if img_width <= widget_rect.width():
+            x_offset = (widget_rect.width() - img_width) // 2
+        else:
+            min_x_offset = widget_rect.width() - img_width
+            x_offset = max(min_x_offset, min(0, x_offset))
+
+        if img_height <= widget_rect.height():
+            y_offset = (widget_rect.height() - img_height) // 2
+        else:
+            min_y_offset = widget_rect.height() - img_height
+            y_offset = max(min_y_offset, min(0, y_offset))
+
+        return x_offset, y_offset, img_width, img_height
+
     def paintEvent(self, event):
         """Override paint event to draw image and bounding boxes."""
         super().paintEvent(event)
@@ -133,28 +187,23 @@ class ImageCanvas(QLabel):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
-        # Calculate scaling to fit pixmap in widget
-        widget_rect = self.rect()
-        pixmap_size = self.current_pixmap.size()
+        x_offset, y_offset, img_width, img_height = self._get_view_geometry()
         scaled_pixmap = self.current_pixmap.scaled(
-            widget_rect.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
+            img_width,
+            img_height,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
             Qt.TransformationMode.SmoothTransformation
         )
-        
-        # Calculate offset to center the pixmap
-        x_offset = (widget_rect.width() - scaled_pixmap.width()) // 2
-        y_offset = (widget_rect.height() - scaled_pixmap.height()) // 2
         
         # Draw pixmap
         painter.drawPixmap(x_offset, y_offset, scaled_pixmap)
         
         # Draw bounding boxes if enabled
         if self.show_boxes and self.boxes:
-            self._draw_boxes(painter, x_offset, y_offset, scaled_pixmap.width(), scaled_pixmap.height())
+            self._draw_boxes(painter, x_offset, y_offset, img_width, img_height)
 
         if self.show_ball and self.ball_position is not None:
-            self._draw_ball_marker(painter, x_offset, y_offset, scaled_pixmap.width(), scaled_pixmap.height())
+            self._draw_ball_marker(painter, x_offset, y_offset, img_width, img_height)
         
         # Draw current drawing box
         if self.is_drawing and self.draw_start and self.draw_end:
@@ -162,6 +211,24 @@ class ImageCanvas(QLabel):
             painter.setPen(pen)
             rect = QRect(self.draw_start, self.draw_end).normalized()
             painter.drawRect(rect)
+
+    def wheelEvent(self, event):
+        """Zoom around the last left-click position on Ctrl+Wheel."""
+        if bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier) and self.current_pixmap is not None:
+            delta_y = event.angleDelta().y()
+            if delta_y == 0:
+                event.accept()
+                return
+            if self.last_left_click_norm is not None:
+                self.zoom_center_norm = self.last_left_click_norm
+            factor = self.zoom_step if delta_y > 0 else (1.0 / self.zoom_step)
+            self.zoom_factor = max(self.zoom_min, min(self.zoom_max, self.zoom_factor * factor))
+            if self.zoom_factor <= self.zoom_min + 1e-6:
+                self.zoom_factor = self.zoom_min
+            self.update()
+            event.accept()
+            return
+        super().wheelEvent(event)
     
     def _draw_boxes(self, painter: QPainter, x_offset: int, y_offset: int, img_width: int, img_height: int):
         """Draw all bounding boxes."""
@@ -248,6 +315,11 @@ class ImageCanvas(QLabel):
         pos = event.pos()
         modifiers = event.modifiers()
 
+        if event.button() == Qt.MouseButton.LeftButton:
+            click_point = self._point_to_normalized(pos)
+            if click_point is not None:
+                self.last_left_click_norm = click_point
+
         if event.button() == Qt.MouseButton.LeftButton and bool(modifiers & Qt.KeyboardModifier.ShiftModifier):
             click_point = self._point_to_normalized(pos)
             if click_point is not None:
@@ -273,6 +345,9 @@ class ImageCanvas(QLabel):
             return
 
         if event.button() == Qt.MouseButton.MiddleButton:
+            if self.annotation_mode == "ball":
+                self.ball_markup_cleared.emit()
+                return
             if clicked_box_idx is not None:
                 self.selected_box_idx = clicked_box_idx
                 self._delete_box(clicked_box_idx)
@@ -392,20 +467,8 @@ class ImageCanvas(QLabel):
         """Find box index at given position."""
         if not self.current_pixmap:
             return None
-        
-        # Get image display area
-        widget_rect = self.rect()
-        pixmap_size = self.current_pixmap.size()
-        scaled_size = self.current_pixmap.scaled(
-            widget_rect.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        ).size()
-        
-        x_offset = (widget_rect.width() - scaled_size.width()) // 2
-        y_offset = (widget_rect.height() - scaled_size.height()) // 2
-        img_width = scaled_size.width()
-        img_height = scaled_size.height()
+
+        x_offset, y_offset, img_width, img_height = self._get_view_geometry()
         
         # Check each box
         for idx, box in enumerate(self.boxes):
@@ -439,19 +502,8 @@ class ImageCanvas(QLabel):
         """Convert pixel rectangle to normalized YOLO box format (without ID - will be assigned later)."""
         if not self.current_pixmap or rect.width() < self.min_box_size_px or rect.height() < self.min_box_size_px:
             return None
-        
-        # Get image display area
-        widget_rect = self.rect()
-        scaled_size = self.current_pixmap.scaled(
-            widget_rect.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        ).size()
-        
-        x_offset = (widget_rect.width() - scaled_size.width()) // 2
-        y_offset = (widget_rect.height() - scaled_size.height()) // 2
-        img_width = scaled_size.width()
-        img_height = scaled_size.height()
+
+        x_offset, y_offset, img_width, img_height = self._get_view_geometry()
         
         # Convert to image-relative coordinates
         x1 = max(0, rect.left() - x_offset)
@@ -479,17 +531,7 @@ class ImageCanvas(QLabel):
         if not self.current_pixmap:
             return None
 
-        widget_rect = self.rect()
-        scaled_size = self.current_pixmap.scaled(
-            widget_rect.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        ).size()
-
-        x_offset = (widget_rect.width() - scaled_size.width()) // 2
-        y_offset = (widget_rect.height() - scaled_size.height()) // 2
-        img_width = scaled_size.width()
-        img_height = scaled_size.height()
+        x_offset, y_offset, img_width, img_height = self._get_view_geometry()
         if img_width <= 0 or img_height <= 0:
             return None
 
@@ -516,18 +558,7 @@ class ImageCanvas(QLabel):
             cls_id, x_c, y_c, w, h = box
             box_id = None
         
-        # Get image display dimensions
-        widget_rect = self.rect()
-        scaled_size = self.current_pixmap.scaled(
-            widget_rect.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        ).size()
-        
-        x_offset = (widget_rect.width() - scaled_size.width()) // 2
-        y_offset = (widget_rect.height() - scaled_size.height()) // 2
-        img_width = scaled_size.width()
-        img_height = scaled_size.height()
+        _, _, img_width, img_height = self._get_view_geometry()
         
         # Convert delta to normalized coordinates
         delta_x_norm = delta.x() / img_width
@@ -627,18 +658,7 @@ class ImageCanvas(QLabel):
         else:
             cls_id, x_c, y_c, w, h = box
         
-        # Get image display dimensions
-        widget_rect = self.rect()
-        scaled_size = self.current_pixmap.scaled(
-            widget_rect.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        ).size()
-        
-        x_offset = (widget_rect.width() - scaled_size.width()) // 2
-        y_offset = (widget_rect.height() - scaled_size.height()) // 2
-        img_width = scaled_size.width()
-        img_height = scaled_size.height()
+        x_offset, y_offset, img_width, img_height = self._get_view_geometry()
         
         # Calculate box corners in pixel coordinates
         box_x1 = int((x_c - w/2) * img_width) + x_offset
@@ -673,18 +693,7 @@ class ImageCanvas(QLabel):
             cls_id, orig_x_c, orig_y_c, orig_w, orig_h = self.drag_box_original
             box_id = None
         
-        # Get image display dimensions
-        widget_rect = self.rect()
-        scaled_size = self.current_pixmap.scaled(
-            widget_rect.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        ).size()
-        
-        x_offset = (widget_rect.width() - scaled_size.width()) // 2
-        y_offset = (widget_rect.height() - scaled_size.height()) // 2
-        img_width = scaled_size.width()
-        img_height = scaled_size.height()
+        _, _, img_width, img_height = self._get_view_geometry()
         
         # Convert delta to normalized coordinates
         delta_x_norm = delta.x() / img_width
